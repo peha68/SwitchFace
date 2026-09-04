@@ -40,6 +40,8 @@
 #include "esp_lcd_sh8601.h"
 #include "driver/spi_master.h"
 #include "esp_err.h"
+#include "esp_sleep.h"
+#include "driver/rtc_io.h"
 
 #define LV_CONF_INCLUDE_SIMPLE 1
 #include "lv_conf.h"
@@ -52,6 +54,16 @@ static constexpr int LCD_HOR_RES = 280;
 static constexpr int LCD_VER_RES = 456;
 static constexpr int I2C_SDA_PIN = 47;
 static constexpr int I2C_SCL_PIN = 48;
+
+// Touch controller's interrupt line - confirmed from Waveshare's own
+// schematic (ESP32-S3-Touch-AMOLED-1.64-Rev1.1.pdf): TP_INT net ties
+// directly (0R resistor) to GPIO18, with a 4.7K pull-up already on the
+// board (active-low: the touch IC pulls it low on a new touch event).
+// GPIO18 is within the ESP32-S3's RTC GPIO range (0-21), so it can wake
+// the chip from deep sleep - this is what makes true wake-on-touch deep
+// sleep possible on this board (see goToDeepSleep() below), unlike a
+// naive assumption that a touch panel can only be polled over I2C.
+static constexpr int TOUCH_INT_PIN = 18;
 
 // ====== Battery voltage ======
 // GPIO4 = ADC1_CH3, with an onboard 3:1 divider (VBAT -> pin = VBAT/3) -
@@ -152,6 +164,35 @@ static void wakeDisplay()
   disp_power_state = DisplayPowerState::FULL;
 }
 
+// Only reachable on battery (see updateDisplayPower() below) - never
+// returns. The chip fully resets on wake, so everything below this call
+// never runs again until setup() starts over from scratch; see the
+// esp_sleep_get_wakeup_cause() check near the top of setup() for how the
+// "first touch after waking just wakes, doesn't also click" behavior is
+// preserved across that reset.
+static void goToDeepSleep()
+{
+  Serial.println("[POWER] Entering deep sleep (battery, idle) - wake on touch (GPIO18/TP_INT)");
+  Serial.flush();
+  if (g_panel) esp_lcd_panel_disp_on_off(g_panel, false);
+
+  // ESP32-S3 GPIOs can reset into a state with an internal pulldown
+  // enabled, which fights the board's own external 4.7K pull-up on
+  // TP_INT hard enough to read as a false LOW - causing an instant
+  // spurious wake with nobody touching anything (seen on real hardware:
+  // woke within ~1s of entering sleep). Clear any internal pulldown
+  // before arming ext0 wake - but do NOT also enable the internal
+  // pull-up on top of the board's own external 4.7K one: ESP-IDF's own
+  // esp_sleep.h docs warn that combining internal and external pull
+  // resistors on a deep-sleep wake pin "may cause interference", and a
+  // first attempt that also called rtc_gpio_pullup_en() here did stop
+  // genuine touches from waking the chip at all on real hardware.
+  rtc_gpio_pulldown_dis((gpio_num_t)TOUCH_INT_PIN);
+
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)TOUCH_INT_PIN, 0); // wake on LOW - TP_INT is active-low
+  esp_deep_sleep_start();
+}
+
 static void updateDisplayPower()
 {
   uint32_t idleMs = millis() - last_activity_ms;
@@ -160,18 +201,10 @@ static void updateDisplayPower()
     Serial.println("[POWER] display -> DIM");
     disp_power_state = DisplayPowerState::DIM;
   } else if (disp_power_state == DisplayPowerState::DIM && !g_usbPresent && idleMs >= BLANK_TIMEOUT_MS) {
-    // Only blank the panel fully when running off the battery - on USB
-    // power there's no battery to save, so just stay dimmed.
-    if (g_panel) esp_lcd_panel_disp_on_off(g_panel, false);
-    Serial.println("[POWER] display -> BLANK");
-    disp_power_state = DisplayPowerState::BLANK;
-  } else if (disp_power_state == DisplayPowerState::BLANK && g_usbPresent) {
-    // USB got plugged in while blanked - bring the panel back to dim
-    // rather than leaving it fully off.
-    if (g_panel) esp_lcd_panel_disp_on_off(g_panel, true);
-    setLcdBrightness(BRIGHTNESS_DIM);
-    Serial.println("[POWER] display -> DIM (USB plugged while blanked)");
-    disp_power_state = DisplayPowerState::DIM;
+    // Only deep-sleep when running off the battery - on USB power there's
+    // no battery to save, so just stay dimmed (see the user's own
+    // requirement: battery-only savings, USB keeps the always-on clock).
+    goToDeepSleep();
   }
 }
 
@@ -639,6 +672,17 @@ void setup()
   Serial.printf("[BOOT] PSRAM: found=%d size=%u free=%u | heap free=%u\n",
                 psramFound(), (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram(),
                 (unsigned)ESP.getFreeHeap());
+
+  // Deep sleep wakes are a full chip reset, not a resume - if this boot
+  // was caused by the touch controller pulling TP_INT low, mark the
+  // display as still "asleep" so touch_read_cb()'s existing wake-swallow
+  // logic (see below) treats the very first touch reading the same way
+  // it already treats a wake from dim/blank: it just wakes the screen,
+  // it doesn't also land a click on whatever's now underneath the finger.
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
+    Serial.println("[BOOT] Woke from deep sleep via touch (GPIO18)");
+    disp_power_state = DisplayPowerState::BLANK;
+  }
 
   if (!display_init()) {
     Serial.println("[BOOT] FATAL: display_init() failed - halting");
