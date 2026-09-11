@@ -1155,7 +1155,14 @@ void setup()
   lv_obj_add_event_cb(update_btn, [](lv_event_t*) {
     if (!update_is_available()) return;
     if (update_status_lbl) lv_label_set_text(update_status_lbl, "Downloading...");
-    lv_timer_handler(); // paint the line above before the blocking call below freezes the UI
+    // A single lv_timer_handler() call only *queues* the redraw - the
+    // actual pixels reach the panel asynchronously via DMA (see
+    // notify_lvgl_flush_ready()), so calling update_perform() (which
+    // blocks for the whole download) immediately after one call raced
+    // right past the flush and the text never visibly appeared on real
+    // hardware. A few calls with a short delay between them give the
+    // transfer time to actually finish before the UI freezes.
+    for (int i = 0; i < 5; i++) { lv_timer_handler(); delay(20); }
     bool ok = update_perform(); // blocks; on success this restarts the device and never returns
     if (update_status_lbl) {
       lv_label_set_text(update_status_lbl, ok ? "Done." : "Update failed - see serial log.");
