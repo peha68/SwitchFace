@@ -36,14 +36,34 @@ int wifi_portal_get_tz_offset_min();
 // its own form on the setup page, independent of WiFi/timezone.
 const char* wifi_portal_get_device_name();
 
-// Home Assistant light-switch config (base URL, long-lived access token,
-// entity_id) - configurable from its own card on the setup page, same
-// pattern as the fields above. wifi_portal_has_ha_config() is true only
-// once all three are non-empty.
+// Home Assistant config (base URL, long-lived access token - one shared HA
+// instance) plus a list of entities (name + entity_id), configurable from
+// its own card on the setup page. wifi_portal_has_ha_config() is true only
+// once url+token are non-empty AND at least one entity is configured.
 bool wifi_portal_has_ha_config();
 const char* wifi_portal_get_ha_url();
 const char* wifi_portal_get_ha_token();
-const char* wifi_portal_get_ha_entity();
+
+// Number of configured entities (0..MAX_HA_ENTITIES, see wifi_portal.cpp).
+int wifi_portal_get_entity_count();
+// Friendly name / entity_id for entity `index` (0-based, must be <
+// wifi_portal_get_entity_count()). Name falls back to the entity_id itself
+// if the owner left it blank on the setup page.
+const char* wifi_portal_get_entity_name(int index);
+const char* wifi_portal_get_entity_id(int index);
+
+// Owner-assigned identity color for entity `index`, as a packed 0xRRGGBB
+// (top byte 0). Applied to the CLOCK screen's button/name for that entity
+// regardless of on/off state - added as a low-vision aid so which entity is
+// on screen can be told apart by color alone, not just by reading the name.
+// Defaults to a distinct color per slot (see DEFAULT_ENTITY_COLORS in
+// wifi_portal.cpp) until the owner picks their own on the setup page.
+uint32_t wifi_portal_get_entity_color(int index);
+
+// OTA (firmware-over-WiFi) password - empty means unprotected. Configurable
+// from its own card on the setup page; takes effect on next boot (saving it
+// restarts the device, same as WiFi/timezone saves).
+const char* wifi_portal_get_ota_password();
 
 // Starts setup mode: AP + DNS (captive portal) + web server with the
 // config form. Blocking for a couple of seconds (WiFi scan) - see the

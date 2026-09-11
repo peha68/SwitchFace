@@ -18,11 +18,12 @@ static String haDomainFromEntity(const String& entity)
     return entity.substring(0, dot);
 }
 
-bool ha_light_toggle()
+bool ha_light_toggle(const char* entityId)
 {
     if (!wifi_portal_has_ha_config() || WiFi.status() != WL_CONNECTED) return false;
+    if (!entityId || !entityId[0]) return false;
 
-    String entity = wifi_portal_get_ha_entity();
+    String entity = entityId;
     String domain = haDomainFromEntity(entity);
     if (domain.length() == 0) return false;
 
@@ -42,11 +43,12 @@ bool ha_light_toggle()
     return code >= 200 && code < 300;
 }
 
-bool ha_light_poll_state(bool* outIsOn)
+bool ha_light_poll_state(const char* entityId, bool* outIsOn)
 {
     if (!wifi_portal_has_ha_config() || WiFi.status() != WL_CONNECTED) return false;
+    if (!entityId || !entityId[0]) return false;
 
-    String entity = wifi_portal_get_ha_entity();
+    String entity = entityId;
     String url = String(wifi_portal_get_ha_url()) + "/api/states/" + entity;
 
     HTTPClient http;

@@ -22,14 +22,44 @@ static String g_pass;
 static int    g_tzOffsetMin = 60; // default UTC+1, overridden by NVS if set
 static String g_deviceName;       // owner-chosen name, empty = use the MAC-suffixed default
 
-// Home Assistant light-switch integration (CLOCK screen tap-to-toggle) -
-// see ha_light.cpp for the actual REST calls. Stored here alongside the
-// other setup-page fields so it goes through the same NVS/web-form
-// machinery instead of being hardcoded (the token especially should never
-// end up committed to the repo).
+// Home Assistant integration (CLOCK screen tap-to-toggle, now a carousel of
+// entities - see ha_light.cpp for the actual REST calls). URL/token are one
+// shared HA instance; entities are a small fixed-size list. Stored here
+// alongside the other setup-page fields so it goes through the same
+// NVS/web-form machinery instead of being hardcoded (the token especially
+// should never end up committed to the repo).
 static String g_haUrl;
 static String g_haToken;
-static String g_haEntity;
+
+// Deliberately a flat NVS string ("name|entity_id" per line, '\n'-joined),
+// not per-index keys and not JSON - matches this project's explicit
+// no-ArduinoJson stance (see ha_light.cpp's header comment). Capped at a
+// small fixed count: this is a swipe carousel on a small touchscreen, not a
+// dashboard - MAX_HA_ENTITIES can be bumped later if that turns out too low.
+static constexpr int MAX_HA_ENTITIES = 6;
+// colorHex is always 6 hex digits, no '#' (the '#' is added/stripped at the
+// HTML <input type=color> boundary only - see handleRoot()/handleSaveHa()).
+struct HaEntity { String name; String entityId; String colorHex; };
+static HaEntity g_haEntities[MAX_HA_ENTITIES];
+static int      g_haEntityCount = 0;
+
+// Distinct default identity color per slot (see wifi_portal_get_entity_
+// color() in wifi_portal.h) - picked so a freshly-configured entity is
+// already visually distinguishable before the owner ever touches the color
+// picker, added as a low-vision aid (told apart by color, not by reading
+// the name). Cycles if there are ever more entities than colors here.
+static const char* const DEFAULT_ENTITY_COLORS[] = {
+    "FFC107", // amber
+    "40C4FF", // cyan
+    "FF4081", // pink
+    "69F0AE", // green
+    "FF6E40", // deep orange
+    "B388FF", // purple
+};
+static constexpr int DEFAULT_ENTITY_COLORS_COUNT = sizeof(DEFAULT_ENTITY_COLORS) / sizeof(DEFAULT_ENTITY_COLORS[0]);
+
+// OTA (firmware-over-WiFi) password - see ota.cpp. Empty = unprotected.
+static String g_otaPassword;
 
 // Curated list of real-world UTC offsets (minutes) for the setup page's
 // timezone <select> - deliberately not every 15-minute step from -12:00
@@ -183,6 +213,70 @@ static String jsonEscape(const String& s)
     return out;
 }
 
+static String defaultColorForIndex(int index)
+{
+    return DEFAULT_ENTITY_COLORS[index % DEFAULT_ENTITY_COLORS_COUNT];
+}
+
+static bool isValidHexColor(const String& s)
+{
+    if (s.length() != 6) return false;
+    for (size_t i = 0; i < 6; i++) {
+        if (!isxdigit((unsigned char)s[i])) return false;
+    }
+    return true;
+}
+
+// Serializes g_haEntities[0..g_haEntityCount) into the flat NVS string
+// format described above g_haEntities' declaration.
+static String serializeEntities()
+{
+    String out;
+    for (int i = 0; i < g_haEntityCount; i++) {
+        if (i > 0) out += '\n';
+        out += g_haEntities[i].name;
+        out += '|';
+        out += g_haEntities[i].entityId;
+        out += '|';
+        out += g_haEntities[i].colorHex;
+    }
+    return out;
+}
+
+// Inverse of serializeEntities() - repopulates g_haEntities/g_haEntityCount
+// from a saved NVS string. Tolerant of a missing 2nd '|' (colorHex just
+// falls back to this slot's default, e.g. entities saved before the color
+// feature existed) and of a missing 1st '|' (whole line treated as the
+// entity_id, name falls back to it) - a corrupt/hand-edited/older-format
+// NVS value shouldn't crash parsing either way.
+static void deserializeEntities(const String& raw)
+{
+    g_haEntityCount = 0;
+    int lineStart = 0;
+    while (lineStart <= (int)raw.length() && g_haEntityCount < MAX_HA_ENTITIES) {
+        int lineEnd = raw.indexOf('\n', lineStart);
+        if (lineEnd < 0) lineEnd = raw.length();
+        if (lineEnd > lineStart) {
+            String line = raw.substring(lineStart, lineEnd);
+            int sep1 = line.indexOf('|');
+            int sep2 = sep1 >= 0 ? line.indexOf('|', sep1 + 1) : -1;
+            HaEntity& e = g_haEntities[g_haEntityCount];
+            if (sep1 >= 0) {
+                e.name = line.substring(0, sep1);
+                e.entityId = sep2 >= 0 ? line.substring(sep1 + 1, sep2) : line.substring(sep1 + 1);
+            } else {
+                e.name = line;
+                e.entityId = line;
+            }
+            String color = sep2 >= 0 ? line.substring(sep2 + 1) : String();
+            e.colorHex = isValidHexColor(color) ? color : defaultColorForIndex(g_haEntityCount);
+            if (e.entityId.length() > 0) g_haEntityCount++;
+        }
+        if (lineEnd >= (int)raw.length()) break;
+        lineStart = lineEnd + 1;
+    }
+}
+
 // Handles GET /scan: runs a fresh scan and returns it as JSON. Called
 // on demand from the page's own JS (see handleRoot()) instead of once
 // up front, so it can be retried without restarting the device.
@@ -234,6 +328,18 @@ static void handleScan()
     WiFi.scanDelete();
     WiFi.mode(WIFI_AP); // back to the low-memory steady state
 
+    // "Connection: close" on every response, here and below - this
+    // WebServer implementation doesn't robustly juggle a kept-alive
+    // connection across requests on this board, and without this, POST
+    // form submissions (timezone/HA config/etc) started silently hanging
+    // client-side after the page had been open and used for a while
+    // (confirmed on real hardware: worked right after boot, degraded with
+    // use) - not tied to any specific handler, since even an untouched one
+    // (timezone save) showed the same symptom, pointing at a shared
+    // connection-handling issue rather than a per-handler bug. Forcing a
+    // fresh TCP connection per request avoids whatever that stale-
+    // connection state was.
+    server.sendHeader("Connection", "close");
     server.send(200, "application/json", json);
 }
 
@@ -246,7 +352,7 @@ static void handleRoot()
     String displayName = g_deviceName.length() > 0 ? htmlEscape(g_deviceName) : "SwitchFace";
 
     String page;
-    page.reserve(5500);
+    page.reserve(7800); // bumped for the per-entity name/id/color row pairs + OTA card
 
     page += "<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -267,6 +373,7 @@ static void handleRoot()
             "select,input{width:100%;padding:11px;margin-top:5px;"
             "background:#111;color:#eee;border:1px solid #333;border-radius:8px;font-size:15px}"
             "select:focus,input:focus{outline:none;border-color:#7b7d7d}"
+            "input[type=color]{width:56px;padding:4px;height:40px}"
             "button{width:100%;padding:13px;margin-top:16px;background:#7b7d7d;color:#111;"
             "border:none;border-radius:8px;font-size:15px;font-weight:600}"
             "button.secondary{background:transparent;color:#ccc;border:1px solid #333;margin-top:8px}"
@@ -316,18 +423,44 @@ static void handleRoot()
             "</form>"
             "</div>"
             "<div class='card'>"
-            "<h2>Home Assistant light switch</h2>"
+            "<h2>Home Assistant</h2>"
             "<form action='/save_ha' method='POST'>"
             "<label>Base URL (e.g. http://192.168.1.50:8123)</label>"
             "<input type='text' name='ha_url' maxlength='64' value='"
             + htmlEscape(g_haUrl) + "'>"
             "<label>Long-Lived Access Token</label>"
             "<input type='password' name='ha_token' maxlength='200' value='"
-            + htmlEscape(g_haToken) + "'>"
-            "<label>Entity ID (e.g. switch.lazienka_lampa)</label>"
-            "<input type='text' name='ha_entity' maxlength='64' value='"
-            + htmlEscape(g_haEntity) + "'>"
-            "<button type='submit'>Save Home Assistant config</button>"
+            + htmlEscape(g_haToken) + "'>";
+    for (int i = 0; i < MAX_HA_ENTITIES; i++) {
+        String name     = i < g_haEntityCount ? g_haEntities[i].name     : String();
+        String entityId = i < g_haEntityCount ? g_haEntities[i].entityId : String();
+        String color    = i < g_haEntityCount ? g_haEntities[i].colorHex : defaultColorForIndex(i);
+        page += "<label>Entity " + String(i + 1) + " name (e.g. Bathroom light)</label>"
+                "<div style='display:flex;gap:8px;align-items:flex-start'>"
+                "<input style='flex:1' type='text' name='entity_name_" + String(i) + "' maxlength='32' value='"
+                + htmlEscape(name) + "'>"
+                // Color picker - a low-vision aid: each entity's CLOCK-screen
+                // button/name uses this color regardless of on/off state, so
+                // entities can be told apart by color alone, not just by
+                // reading the (small) name. Defaults to a distinct built-in
+                // color per slot (defaultColorForIndex()) until customized.
+                "<input type='color' name='entity_color_" + String(i) + "' value='#" + color + "'>"
+                "</div>"
+                "<label>Entity " + String(i + 1) + " ID (e.g. switch.lazienka_lampa)</label>"
+                "<input type='text' name='entity_id_" + String(i) + "' maxlength='64' value='"
+                + htmlEscape(entityId) + "'>";
+    }
+    page += "<button type='submit'>Save Home Assistant config</button>"
+            "</form>"
+            "</div>"
+            "<div class='card'>"
+            "<h2>Firmware update (OTA)</h2>"
+            "<form action='/save_ota' method='POST'>"
+            "<label>Password (leave blank for no password - only do this on a "
+            "trusted network)</label>"
+            "<input type='password' name='ota_pass' maxlength='64' value='"
+            + htmlEscape(g_otaPassword) + "'>"
+            "<button type='submit'>Save OTA password</button>"
             "</form>"
             "</div>"
             "<script>"
@@ -354,6 +487,7 @@ static void handleRoot()
             "</script>"
             "</body></html>";
 
+    server.sendHeader("Connection", "close");
     server.send(200, "text/html", page);
 }
 
@@ -363,6 +497,7 @@ static void handleSave()
     String pass = server.arg("pass");
 
     if (ssid.length() == 0) {
+        server.sendHeader("Connection", "close");
         server.send(400, "text/plain", "Missing SSID.");
         return;
     }
@@ -372,6 +507,7 @@ static void handleSave()
     prefsWifi.putString("pass", pass);
     prefsWifi.end();
 
+    server.sendHeader("Connection", "close");
     server.send(200, "text/html",
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
@@ -393,6 +529,7 @@ static void handleSaveTz()
     prefsWifi.end();
     g_tzOffsetMin = tzMin;
 
+    server.sendHeader("Connection", "close");
     server.send(200, "text/html",
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
@@ -417,6 +554,7 @@ static void handleSaveName()
     prefsWifi.end();
     g_deviceName = name;
 
+    server.sendHeader("Connection", "close");
     server.send(200, "text/html",
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
@@ -429,41 +567,121 @@ static void handleSaveName()
 
 static void handleSaveHa()
 {
-    String url    = server.arg("ha_url");
-    String token  = server.arg("ha_token");
-    String entity = server.arg("ha_entity");
-    url.trim(); token.trim(); entity.trim();
+    Serial.printf("[WIFI-PORTAL] POST /save_ha received from %s (heap free=%u, args=%d)\n",
+                  server.client().remoteIP().toString().c_str(),
+                  (unsigned)ESP.getFreeHeap(), server.args());
+    String url   = server.arg("ha_url");
+    String token = server.arg("ha_token");
+    url.trim(); token.trim();
     while (url.endsWith("/")) url.remove(url.length() - 1); // normalize away a trailing slash before we start concatenating paths onto it
+
+    HaEntity parsed[MAX_HA_ENTITIES];
+    int parsedCount = 0;
+    for (int i = 0; i < MAX_HA_ENTITIES; i++) {
+        String name = server.arg("entity_name_" + String(i));
+        String id   = server.arg("entity_id_" + String(i));
+        name.trim(); id.trim();
+        if (id.length() == 0) continue; // empty row - skip, not an error
+
+        // '|' and '\n' are the NVS serialization delimiters (see
+        // serializeEntities()) - strip them from the name so a saved value
+        // can never be misparsed back out. entity_id itself can't contain
+        // either (HA entity_ids are alnum/underscore/dot), so it's left as-is.
+        String cleanName;
+        cleanName.reserve(name.length());
+        for (size_t c = 0; c < name.length(); c++) {
+            char ch = name[c];
+            if (ch != '|' && ch != '\n' && ch != '\r') cleanName += ch;
+        }
+        if (cleanName.length() == 0) cleanName = id; // default to the entity_id if left blank
+
+        // <input type=color> always sends "#rrggbb" - strip the '#' and
+        // fall back to this slot's default if it's ever missing/malformed
+        // (e.g. a request that didn't come from this exact form).
+        String color = server.arg("entity_color_" + String(i));
+        color.trim();
+        if (color.startsWith("#")) color.remove(0, 1);
+        if (!isValidHexColor(color)) color = defaultColorForIndex(parsedCount);
+
+        parsed[parsedCount].name = cleanName;
+        parsed[parsedCount].entityId = id;
+        parsed[parsedCount].colorHex = color;
+        parsedCount++;
+    }
+
+    for (int i = 0; i < parsedCount; i++) g_haEntities[i] = parsed[i];
+    g_haEntityCount = parsedCount;
+    String entitiesRaw = serializeEntities();
 
     prefsWifi.begin(NVS_NAMESPACE, false);
     prefsWifi.putString("ha_url", url);
     prefsWifi.putString("ha_token", token);
-    prefsWifi.putString("ha_entity", entity);
+    prefsWifi.putString("ha_entities", entitiesRaw);
     prefsWifi.end();
     g_haUrl = url;
     g_haToken = token;
-    g_haEntity = entity;
 
+    server.sendHeader("Connection", "close");
     server.send(200, "text/html",
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
         "<body style='font-family:sans-serif;background:#111;color:#eee;padding:20px'>"
-        "<h2>Saved.</h2><p>Used by the light-switch button on the CLOCK screen.</p>"
+        "<h2>Saved.</h2><p>Used by the entity carousel on the CLOCK screen.</p>"
         "</body></html>");
 
-    Serial.printf("[WIFI-PORTAL] Saved HA config: url='%s' entity='%s' (token hidden)\n",
-                  url.c_str(), entity.c_str());
+    Serial.printf("[WIFI-PORTAL] Saved HA config: url='%s' entities=%d (token hidden)\n",
+                  url.c_str(), g_haEntityCount);
+}
+
+static void handleSaveOta()
+{
+    String pass = server.arg("ota_pass");
+
+    prefsWifi.begin(NVS_NAMESPACE, false);
+    prefsWifi.putString("ota_pass", pass);
+    prefsWifi.end();
+    g_otaPassword = pass;
+
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html",
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
+        "<body style='font-family:sans-serif;background:#111;color:#eee;padding:20px'>"
+        "<h2>Saved.</h2><p>Restarting...</p>"
+        "</body></html>");
+
+    Serial.println("[WIFI-PORTAL] Saved OTA password. Restarting...");
+    delay(1200);
+    ESP.restart();
+}
+
+// Browsers silently GET /favicon.ico on every page load - without this,
+// that fell through to onNotFound() -> handleRoot(), serving the ENTIRE
+// ~7KB setup page a second time for nothing. WebServer (this library) only
+// ever services one client connection at a time, with up to 5s to wait for
+// data plus 5s to wait for the client to close (HTTP_MAX_DATA_WAIT/
+// HTTP_MAX_CLOSE_WAIT in WebServer.h) - so that wasted favicon request
+// could occupy the server's only connection slot for several seconds right
+// when a real request (e.g. the entity-save POST) was trying to get in.
+// Confirmed on real hardware as a major contributor to POST saves silently
+// hanging - a tiny, instant 204 here closes that window.
+static void handleFavicon()
+{
+    server.sendHeader("Connection", "close");
+    server.send(204);
 }
 
 static void ensureHttpHandlersRegistered()
 {
     if (g_httpHandlersRegistered) return;
     server.on("/", HTTP_GET, handleRoot);
+    server.on("/favicon.ico", HTTP_GET, handleFavicon);
     server.on("/scan", HTTP_GET, handleScan);
     server.on("/save", HTTP_POST, handleSave);
     server.on("/save_tz", HTTP_POST, handleSaveTz);
     server.on("/save_name", HTTP_POST, handleSaveName);
     server.on("/save_ha", HTTP_POST, handleSaveHa);
+    server.on("/save_ota", HTTP_POST, handleSaveOta);
     server.onNotFound(handleRoot);
     g_httpHandlersRegistered = true;
 }
@@ -479,17 +697,39 @@ void wifi_portal_init()
     g_deviceName = prefsWifi.getString("devname", "");
     g_haUrl       = prefsWifi.getString("ha_url", "");
     g_haToken     = prefsWifi.getString("ha_token", "");
-    g_haEntity    = prefsWifi.getString("ha_entity", "");
+    deserializeEntities(prefsWifi.getString("ha_entities", ""));
+    g_otaPassword = prefsWifi.getString("ota_pass", "");
     prefsWifi.end();
 }
 
 bool wifi_portal_has_ha_config()
 {
-    return g_haUrl.length() > 0 && g_haToken.length() > 0 && g_haEntity.length() > 0;
+    return g_haUrl.length() > 0 && g_haToken.length() > 0 && g_haEntityCount > 0;
 }
 const char* wifi_portal_get_ha_url()    { return g_haUrl.c_str(); }
 const char* wifi_portal_get_ha_token()  { return g_haToken.c_str(); }
-const char* wifi_portal_get_ha_entity() { return g_haEntity.c_str(); }
+
+int wifi_portal_get_entity_count() { return g_haEntityCount; }
+
+const char* wifi_portal_get_entity_name(int index)
+{
+    if (index < 0 || index >= g_haEntityCount) return "";
+    return g_haEntities[index].name.c_str();
+}
+
+const char* wifi_portal_get_entity_id(int index)
+{
+    if (index < 0 || index >= g_haEntityCount) return "";
+    return g_haEntities[index].entityId.c_str();
+}
+
+uint32_t wifi_portal_get_entity_color(int index)
+{
+    if (index < 0 || index >= g_haEntityCount) return 0xFFFFFF;
+    return (uint32_t)strtoul(g_haEntities[index].colorHex.c_str(), nullptr, 16);
+}
+
+const char* wifi_portal_get_ota_password() { return g_otaPassword.c_str(); }
 
 const char* wifi_portal_get_device_name() { return g_deviceName.c_str(); }
 
@@ -508,6 +748,17 @@ void wifi_portal_start_ap()
     if (g_apActive) return;
 
     Serial.println("[WIFI-PORTAL] Starting setup AP...");
+
+    // About to fully disconnect STA below - if the monitor/setup web server
+    // is currently serving over that STA connection (it now runs
+    // persistently in the background, see wifi_monitor_start() being
+    // called from wifi_ntp_update_state()), it MUST be cleanly stopped
+    // first. Confirmed on real hardware: skipping this crashed hard
+    // (igmp_lookup_group assert and, separately, a LoadProhibited panic -
+    // different symptoms of the same root cause) - MDNS/the WebServer were
+    // still bound to the STA interface's multicast group/socket when
+    // WiFi.disconnect() below tore it down under them.
+    if (g_monitorServing) wifi_monitor_stop();
 
     static bool eventHandlerRegistered = false;
     if (!eventHandlerRegistered) {
@@ -587,8 +838,43 @@ IPAddress wifi_portal_ap_ip() { return g_apIp; }
 
 void wifi_monitor_start()
 {
+    // Idempotent - safe to call both from wifi_ntp_update_state() (as soon
+    // as STA connects, so the setup page stays reachable from any screen,
+    // not just while physically on REMOTE SETUP - confirmed on real
+    // hardware to be a frequent source of "the page won't load" reports
+    // that were actually just the device sitting on a different screen)
+    // and from monitor_screen_on_enter(). Re-running server.begin()/
+    // MDNS.begin() while already serving would be redundant at best.
+    if (g_monitorServing || (g_monitorUsingOwnAp && g_apActive)) return;
 
-    if (WiFi.status() == WL_CONNECTED) {
+    // Reconnecting to a saved network after leaving SETUP is asynchronous
+    // (wifi_begin_nonblocking() just kicks off WiFi.begin() and returns) -
+    // landing here right after leaving SETUP (e.g. swiping straight back to
+    // MONITOR) could otherwise catch WiFi mid-negotiation and wrongly
+    // conclude there's "no STA connection", falling back to this device's
+    // own AP even though it was about to reconnect just fine. Give it a
+    // bounded moment to finish first - confirmed on real hardware that
+    // without this, SETUP -> MONITOR reliably landed on the own-AP fallback
+    // instead of the real network.
+    // WiFi.status() == WL_CONNECTED only means associated/authenticated -
+    // it does NOT guarantee DHCP has actually handed out a usable address.
+    // Confirmed on real hardware via [NETDIAG] logging in main.cpp: status
+    // read WL_CONNECTED while WiFi.localIP() was still 0.0.0.0, which would
+    // have made this start serving on an unreachable interface while
+    // believing it had succeeded. Both checks below require a real IP too.
+    auto hasValidIp = []() { return WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0); };
+
+    if (!hasValidIp() && wifi_portal_has_credentials()) {
+        Serial.println("[MONITOR] Not connected yet - giving reconnect up to 4s before falling back to own AP...");
+        uint32_t waitStart = millis();
+        while (!hasValidIp() && millis() - waitStart < 4000) {
+            delay(100);
+        }
+        Serial.printf("[MONITOR] After wait: status=%d ip=%s (%s)\n",
+                      (int)WiFi.status(), WiFi.localIP().toString().c_str(), hasValidIp() ? "connected" : "still not connected");
+    }
+
+    if (hasValidIp()) {
         g_monitorUsingOwnAp = false;
         ensureHttpHandlersRegistered();
         server.begin();

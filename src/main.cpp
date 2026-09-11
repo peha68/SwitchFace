@@ -1,6 +1,7 @@
-// SwitchFace - AMOLED touch clock + Home Assistant light switch, on a
-// Waveshare ESP32-S3-Touch-AMOLED-1.64(-v2) (V1/CO5300 revision - see the
-// display driver notes below).
+// SwitchFace - AMOLED touch clock + multi-entity Home Assistant light
+// switch, on a Waveshare ESP32-S3-Touch-AMOLED-1.64(-v2) (V1/CO5300
+// revision - see the display driver notes below). See README.md for the
+// full feature list, setup instructions, and screen/gesture map.
 //
 // Grew out of a TiltDash (vehicle leveling) bring-up board for this same
 // display, hence some of the lower-level driver/touch/power-management
@@ -9,7 +10,8 @@
 // so it stayed. The tilt-sensing screens/IMU code did not - this project
 // has none of that.
 //
-// STATUS: CLOCK and SETUP are ported and tested on real hardware. The
+// STATUS: all four screens (CLOCK entity carousel, WIFI SETUP, REMOTE
+// SETUP, and OTA) are ported and verified end-to-end on real hardware. The
 // on-device SETUP screen shows the hotspot name/address as text only (no
 // QR code widget yet - a real follow-up, not skipped for a good reason,
 // just extra scope this pass didn't need).
@@ -33,6 +35,7 @@
 #include <math.h>
 #include "wifi_portal.h"
 #include "ha_light.h"
+#include "ota.h"
 
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -40,8 +43,7 @@
 #include "esp_lcd_sh8601.h"
 #include "driver/spi_master.h"
 #include "esp_err.h"
-#include "esp_sleep.h"
-#include "driver/rtc_io.h"
+#include "esp_system.h"
 
 #define LV_CONF_INCLUDE_SIMPLE 1
 #include "lv_conf.h"
@@ -50,20 +52,16 @@
 #include "esp_timer.h"
 #include "FT3168.h"
 
+// Custom font with Polish diacritics - see font_pl_34.c and its use on
+// clock_entity_name_lbl below for why.
+LV_FONT_DECLARE(font_pl_34);
+
 static constexpr int LCD_HOR_RES = 280;
 static constexpr int LCD_VER_RES = 456;
 static constexpr int I2C_SDA_PIN = 47;
 static constexpr int I2C_SCL_PIN = 48;
 
-// Touch controller's interrupt line - confirmed from Waveshare's own
-// schematic (ESP32-S3-Touch-AMOLED-1.64-Rev1.1.pdf): TP_INT net ties
-// directly (0R resistor) to GPIO18, with a 4.7K pull-up already on the
-// board (active-low: the touch IC pulls it low on a new touch event).
-// GPIO18 is within the ESP32-S3's RTC GPIO range (0-21), so it can wake
-// the chip from deep sleep - this is what makes true wake-on-touch deep
-// sleep possible on this board (see goToDeepSleep() below), unlike a
-// naive assumption that a touch panel can only be polled over I2C.
-static constexpr int TOUCH_INT_PIN = 18;
+static FT3168 tp(I2C_SDA_PIN, I2C_SCL_PIN, -1, -1);
 
 // ====== Battery voltage ======
 // GPIO4 = ADC1_CH3, with an onboard 3:1 divider (VBAT -> pin = VBAT/3) -
@@ -120,8 +118,14 @@ static constexpr float BATTERY_CRITICAL_V  = 3.3f;
 // here. CPU throttling on top of that is a smaller, easy win.
 static constexpr uint32_t DIM_TIMEOUT_MS   = 15000; // idle -> dim
 static constexpr uint32_t BLANK_TIMEOUT_MS = 60000; // idle -> panel off
-static constexpr uint8_t  BRIGHTNESS_FULL  = 0xD0;  // matches lcd_init_cmds' boot value
-static constexpr uint8_t  BRIGHTNESS_DIM   = 0x20;
+// AMOLED current draw scales with how brightly pixels are actually
+// driven (unlike an LCD backlight, which is roughly all-or-nothing) - so
+// unlike DIM (already only used right before going dark), "full"
+// brightness itself is worth lowering on battery too, since that's the
+// state the panel spends most of its awake time in.
+static constexpr uint8_t  BRIGHTNESS_FULL_USB     = 0x33; // ~20% of WRDISBV's 0x00-0xFF range
+static constexpr uint8_t  BRIGHTNESS_FULL_BATTERY = 0x33; // same ~20% - user wants both USB and battery full-brightness this low
+static constexpr uint8_t  BRIGHTNESS_DIM          = 0x20;
 static constexpr uint32_t CPU_MHZ_USB      = 240;
 static constexpr uint32_t CPU_MHZ_BATTERY  = 160; // LVGL still needs to stay responsive - 80MHz visibly lags
 
@@ -132,6 +136,21 @@ static esp_lcd_panel_io_handle_t g_panel_io = nullptr;
 static esp_lcd_panel_handle_t g_panel = nullptr;
 static bool g_usbPresent = false; // updated each battery-tick from isCharging(vbat)
 
+// esp_lcd_sh8601's own tx_param() (used for every lcd_init_cmds entry, and
+// by esp_lcd_panel_disp_on_off()) never sends a raw DCS command byte - in
+// QSPI mode it wraps it into a 32-bit frame first: (0x02 << 24) | (cmd <<
+// 8), 0x02 being this panel's "write command" opcode (see
+// lib/esp_lcd_sh8601/esp_lcd_sh8601.c's LCD_OPCODE_WRITE_CMD and its
+// static tx_param()). That wrapper is private to the driver, so it can't
+// be called from here - but esp_lcd_panel_io_tx_param() itself is public,
+// and skipping the wrapper (passing 0x53/0x51 as the raw "cmd" argument)
+// sends a completely different, meaningless command instead of the
+// intended DCS one. The panel just silently ignores it (ESP_OK, no
+// error, no visible effect) - which is exactly the "brightness never
+// changes" symptom seen on real hardware. Replicate the same encoding
+// here so these two writes actually reach WRCTRLD/WRDISBV.
+static inline uint32_t sh8601Cmd(uint8_t dcsCmd) { return (0x02UL << 24) | ((uint32_t)dcsCmd << 8); }
+
 // 0x51 = MIPI DCS "Write Display Brightness" - same register lcd_init_cmds
 // sets once at boot; this just lets it be changed again at runtime.
 static void setLcdBrightness(uint8_t level)
@@ -140,14 +159,13 @@ static void setLcdBrightness(uint8_t level)
     Serial.println("[POWER] setLcdBrightness: g_panel_io is NULL");
     return;
   }
-  // lcd_init_cmds only ever turns on BCTRL (bit5) in the 0x53 Write_CTRL_
-  // Display register - the DD (dimming, bit3) and BL (backlight block,
-  // bit2) bits stay off. 0x51 alone reported ESP_OK on real hardware but
-  // produced no visible change, which matches BL being required for the
-  // brightness block to actually drive the panel, not just accept writes.
-  uint8_t ctrl = 0x2C; // BCTRL | DD | BL
-  esp_err_t ctrlErr = esp_lcd_panel_io_tx_param(g_panel_io, 0x53, &ctrl, 1);
-  esp_err_t err = esp_lcd_panel_io_tx_param(g_panel_io, 0x51, &level, 1);
+  // lcd_init_cmds itself proves BCTRL alone (ctrl=0x20, no DD/BL) is enough
+  // for 0x51 to take effect: it goes from brightness 0 (screen still dark)
+  // to 0xD0 (full) with that same ctrl value and no re-send in between.
+  uint8_t ctrl = 0x20; // BCTRL only
+  esp_err_t ctrlErr = esp_lcd_panel_io_tx_param(g_panel_io, sh8601Cmd(0x53), &ctrl, 1);
+  delay(2); // lcd_init_cmds waits 1ms after this same command - give the panel time to latch CTRL before WRDISBV
+  esp_err_t err = esp_lcd_panel_io_tx_param(g_panel_io, sh8601Cmd(0x51), &level, 1);
   Serial.printf("[POWER] setLcdBrightness(0x%02X): ctrl53=%s wrbv51=%s\n",
                 level, esp_err_to_name(ctrlErr), esp_err_to_name(err));
 }
@@ -159,40 +177,20 @@ static void wakeDisplay()
   if (disp_power_state == DisplayPowerState::BLANK && g_panel) {
     esp_lcd_panel_disp_on_off(g_panel, true);
   }
-  setLcdBrightness(BRIGHTNESS_FULL);
+  setLcdBrightness(g_usbPresent ? BRIGHTNESS_FULL_USB : BRIGHTNESS_FULL_BATTERY);
   Serial.println("[POWER] display -> FULL (wake)");
   disp_power_state = DisplayPowerState::FULL;
 }
 
-// Only reachable on battery (see updateDisplayPower() below) - never
-// returns. The chip fully resets on wake, so everything below this call
-// never runs again until setup() starts over from scratch; see the
-// esp_sleep_get_wakeup_cause() check near the top of setup() for how the
-// "first touch after waking just wakes, doesn't also click" behavior is
-// preserved across that reset.
-static void goToDeepSleep()
-{
-  Serial.println("[POWER] Entering deep sleep (battery, idle) - wake on touch (GPIO18/TP_INT)");
-  Serial.flush();
-  if (g_panel) esp_lcd_panel_disp_on_off(g_panel, false);
-
-  // ESP32-S3 GPIOs can reset into a state with an internal pulldown
-  // enabled, which fights the board's own external 4.7K pull-up on
-  // TP_INT hard enough to read as a false LOW - causing an instant
-  // spurious wake with nobody touching anything (seen on real hardware:
-  // woke within ~1s of entering sleep). Clear any internal pulldown
-  // before arming ext0 wake - but do NOT also enable the internal
-  // pull-up on top of the board's own external 4.7K one: ESP-IDF's own
-  // esp_sleep.h docs warn that combining internal and external pull
-  // resistors on a deep-sleep wake pin "may cause interference", and a
-  // first attempt that also called rtc_gpio_pullup_en() here did stop
-  // genuine touches from waking the chip at all on real hardware.
-  rtc_gpio_pulldown_dis((gpio_num_t)TOUCH_INT_PIN);
-
-  esp_sleep_enable_ext0_wakeup((gpio_num_t)TOUCH_INT_PIN, 0); // wake on LOW - TP_INT is active-low
-  esp_deep_sleep_start();
-}
-
+// Deep sleep (ext0 wake on the touch controller's TP_INT line) and light
+// sleep (GPIO+timer wakeup) were both tried and abandoned: real-hardware
+// testing showed TP_INT never actually moves on a genuine touch (so a
+// level-triggered RTC wake on it can't work regardless of pull tuning),
+// and esp_light_sleep_start() simply hangs with the native USB-CDC
+// connection attached. BLANK below is therefore just the panel physically
+// switched off - the MCU keeps running completely normally, so the
+// already-existing touch_read_cb()/wakeDisplay() path (same one DIM uses)
+// is what brings it back on the next touch; no sleep API involved.
 static void updateDisplayPower()
 {
   uint32_t idleMs = millis() - last_activity_ms;
@@ -201,10 +199,18 @@ static void updateDisplayPower()
     Serial.println("[POWER] display -> DIM");
     disp_power_state = DisplayPowerState::DIM;
   } else if (disp_power_state == DisplayPowerState::DIM && !g_usbPresent && idleMs >= BLANK_TIMEOUT_MS) {
-    // Only deep-sleep when running off the battery - on USB power there's
-    // no battery to save, so just stay dimmed (see the user's own
-    // requirement: battery-only savings, USB keeps the always-on clock).
-    goToDeepSleep();
+    // Only blank the panel fully when running off the battery - on USB
+    // power there's no battery to save, so just stay dimmed.
+    if (g_panel) esp_lcd_panel_disp_on_off(g_panel, false);
+    Serial.println("[POWER] display -> BLANK");
+    disp_power_state = DisplayPowerState::BLANK;
+  } else if (disp_power_state == DisplayPowerState::BLANK && g_usbPresent) {
+    // USB got plugged in while blanked - bring the panel back to dim
+    // rather than leaving it fully off.
+    if (g_panel) esp_lcd_panel_disp_on_off(g_panel, true);
+    setLcdBrightness(BRIGHTNESS_DIM);
+    Serial.println("[POWER] display -> DIM (USB plugged while blanked)");
+    disp_power_state = DisplayPowerState::DIM;
   }
 }
 
@@ -370,6 +376,7 @@ static bool display_init()
 // that was only ever a bring-up stopgap until SETUP itself was ported.
 static bool     g_wifiOk         = false;
 static bool     g_ntpConfigured  = false;
+static bool     g_otaInitialized = false; // see wifi_ntp_update_state() - ota_init() must wait until WiFi.mode() has actually run once, or ArduinoOTA.begin()'s UDP/mDNS setup crashes (xQueueSemaphoreTake assert on an uninitialized network stack) - confirmed on real hardware
 static uint32_t g_lastWifiTryMs  = 0;
 static constexpr uint32_t WIFI_RETRY_MS = 15000;
 
@@ -387,10 +394,22 @@ static void wifi_begin_nonblocking()
   g_lastWifiTryMs = millis();
 }
 
+// WiFi.status() == WL_CONNECTED only means "associated/authenticated with
+// the AP" - it does NOT guarantee DHCP has actually handed out a usable
+// address. Confirmed on real hardware via the new [NETDIAG] logging: status
+// read WL_CONNECTED while WiFi.localIP() was still 0.0.0.0, which meant
+// ota_init()/wifi_monitor_start() below were firing (and reporting success)
+// against an interface with no real address - the device believed it was
+// online and reachable while actually being unreachable from anywhere else
+// on the network. This is likely the root cause behind most of tonight's
+// "the setup page just won't load" reports, not just today's more obvious
+// bugs (crash on SETUP entry, favicon, etc).
+static inline bool wifiHasValidIp() { return WiFi.status() == WL_CONNECTED && WiFi.localIP() != IPAddress(0, 0, 0, 0); }
+
 static void wifi_ntp_update_state()
 {
   uint32_t now = millis();
-  if (WiFi.status() == WL_CONNECTED) {
+  if (wifiHasValidIp()) {
     if (!g_wifiOk) {
       g_wifiOk = true;
       Serial.printf("[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
@@ -399,11 +418,27 @@ static void wifi_ntp_update_state()
       g_ntpConfigured = true;
       configTime((long)wifi_portal_get_tz_offset_min() * 60, 0, "pool.ntp.org");
     }
+    if (!g_otaInitialized) {
+      g_otaInitialized = true;
+      ota_init();
+    }
+    // Start serving the setup/config web page as soon as STA connects,
+    // regardless of which screen is showing - wifi_monitor_start() is
+    // idempotent (see its own comment), so this is safe alongside the
+    // still-existing monitor_screen_on_enter() call for the AP-fallback
+    // case (no STA yet).
+    wifi_monitor_start();
   } else {
     if (g_wifiOk) {
       g_wifiOk = false;
       g_ntpConfigured = false;
       Serial.println("[WiFi] Disconnected.");
+      // Stop the STA-bound monitor server/mDNS now rather than leaving it
+      // stale and bound to a connection that's gone (or stuck at 0.0.0.0) -
+      // wifi_monitor_start() will cleanly re-launch it once wifiHasValidIp()
+      // is true again. Leave the own-AP fallback alone if that's what's
+      // active - unrelated to this STA-side transition.
+      if (!wifi_monitor_using_own_ap()) wifi_monitor_stop();
     }
     if (now - g_lastWifiTryMs >= WIFI_RETRY_MS) {
       Serial.println("[WiFi] Retry connect...");
@@ -416,11 +451,23 @@ static void wifi_ntp_update_state()
 static lv_obj_t* clock_wifi    = nullptr;
 static lv_obj_t* clock_offline = nullptr;
 static lv_obj_t* clock_battery = nullptr;
+// Top-center status icons: setup/config web server reachable, and last
+// Home Assistant poll result - dim gray when off/unknown, lit when good.
+// Updated once a second alongside clock_wifi/clock_offline below.
+static lv_obj_t* clock_srv_icon = nullptr;
+static lv_obj_t* clock_ha_icon  = nullptr;
+static bool      g_haLastPollOk = false; // meaningful only alongside wifi_portal_has_ha_config()
 static lv_obj_t* clock_time    = nullptr;
 static lv_obj_t* clock_date    = nullptr;
 
-// Home Assistant light-switch button - tap to toggle, color reflects the
-// last known state polled from HA (gray = off/unknown, yellow = on).
+// Currently-selected entity in the carousel (see update_entity_ui() and
+// gesture_event_cb()'s SCR_CLOCK case) - name shown here, above the button.
+static lv_obj_t* clock_entity_name_lbl = nullptr;
+static int       g_currentEntityIdx    = 0;
+
+// Home Assistant light-switch button - tap to toggle the currently-selected
+// carousel entity, color reflects its last known state polled from HA
+// (gray = off/unknown, yellow = on).
 static lv_obj_t* clock_light_btn  = nullptr;
 static lv_obj_t* clock_light_icon = nullptr;
 static bool g_haLightOn = false;
@@ -452,6 +499,7 @@ static void setup_screen_on_enter();
 static void setup_screen_on_leave();
 static void monitor_screen_on_enter();
 static void monitor_screen_on_leave();
+static void clock_screen_on_enter();
 
 static lv_obj_t* screen_obj(Screen s)
 {
@@ -471,15 +519,58 @@ static void switch_screen(Screen s)
   current_screen = s;
   lv_scr_load(screen_obj(s));
 
+  if (s == SCR_CLOCK) clock_screen_on_enter();
   if (s == SCR_SETUP) setup_screen_on_enter();
   if (s == SCR_MONITOR) monitor_screen_on_enter();
 }
 
+// Button (and entity name label, see update_entity_ui()) use the current
+// entity's own identity color regardless of on/off state - a low-vision
+// aid the user asked for: entities can be told apart by color alone, not
+// just by reading the (comparatively small) name. On/off is conveyed by
+// brightness of that same hue (full color vs darkened), not by switching
+// to an unrelated color, so the identity stays recognizable either way.
 static void update_light_btn_style()
 {
   if (!clock_light_btn) return;
-  lv_obj_set_style_bg_color(clock_light_btn, g_haLightOn ? lv_color_hex(0xFFC107) : lv_color_hex(0x333333), 0);
-  lv_obj_set_style_text_color(clock_light_icon, g_haLightOn ? lv_color_black() : lv_color_hex(0x888888), 0);
+  lv_color_t entityColor = lv_color_hex(wifi_portal_get_entity_color(g_currentEntityIdx));
+  lv_color_t bg = g_haLightOn ? entityColor : lv_color_darken(entityColor, LV_OPA_70);
+  lv_obj_set_style_bg_color(clock_light_btn, bg, 0);
+  lv_obj_set_style_text_color(clock_light_icon, g_haLightOn ? lv_color_black() : lv_color_white(), 0);
+  if (clock_entity_name_lbl) lv_obj_set_style_text_color(clock_entity_name_lbl, entityColor, 0);
+}
+
+// Called whenever the selected carousel entry changes (swipe left/right, or
+// landing back on CLOCK - see clock_screen_on_enter()): updates the name
+// label and immediately polls the newly-selected entity's real state,
+// rather than showing the previous entity's color until the next periodic
+// poll (up to 5s later, see loop()) catches up.
+static void update_entity_ui()
+{
+  if (!clock_entity_name_lbl) return;
+
+  int count = wifi_portal_get_entity_count();
+  if (count <= 0) {
+    lv_label_set_text(clock_entity_name_lbl, "No entity configured");
+    g_haLightOn = false;
+    g_haLastPollOk = false;
+    update_light_btn_style();
+    return;
+  }
+
+  lv_label_set_text(clock_entity_name_lbl, wifi_portal_get_entity_name(g_currentEntityIdx));
+
+  bool isOn = false;
+  if (ha_light_poll_state(wifi_portal_get_entity_id(g_currentEntityIdx), &isOn)) {
+    g_haLightOn = isOn;
+    g_haLastPollOk = true;
+  } else {
+    // Unknown/offline - default to the "off" visual rather than carrying
+    // over whatever the previously-selected entity's state happened to be.
+    g_haLightOn = false;
+    g_haLastPollOk = false;
+  }
+  update_light_btn_style();
 }
 
 // Blocking HTTP round-trip (see ha_light.cpp) - runs synchronously inside
@@ -488,7 +579,10 @@ static void update_light_btn_style()
 // occasional tap; revisit with a background task if it ever feels janky.
 static void do_ha_light_toggle()
 {
-  bool ok = ha_light_toggle();
+  int count = wifi_portal_get_entity_count();
+  if (count <= 0) return;
+
+  bool ok = ha_light_toggle(wifi_portal_get_entity_id(g_currentEntityIdx));
   if (ok) {
     // Optimistic flip for instant feedback - the next periodic poll (see
     // loop()) will correct this within a few seconds if the toggle
@@ -505,6 +599,14 @@ static void ha_light_btn_cb(lv_event_t* e)
   do_ha_light_toggle();
 }
 
+// NOTE: an earlier version of this handler had SETUP/MONITOR react to "any
+// swipe direction" instead of a specific one, because real-hardware testing
+// at the time found LEFT/RIGHT swipes always coming out classified as
+// TOP/BOTTOM by LVGL's gesture detector (see the [GESTURE] log line below -
+// it's the tool to check this with). This version requires the two axes to
+// actually be distinguishable (LEFT/RIGHT = entity carousel, UP/DOWN =
+// wifi/setup carousel) - verify on real hardware; if direction still comes
+// out wrong, this navigation won't behave as intended.
 static void gesture_event_cb(lv_event_t* e)
 {
   lv_indev_t* indev = lv_indev_get_act();
@@ -513,19 +615,54 @@ static void gesture_event_cb(lv_event_t* e)
   Serial.printf("[GESTURE] screen=%d dir=%d\n", (int)current_screen, (int)dir);
 
   switch (current_screen) {
-    case SCR_CLOCK:
-      if (dir == LV_DIR_LEFT) switch_screen(SCR_SETUP);
-      else if (dir == LV_DIR_RIGHT) switch_screen(SCR_MONITOR);
+    case SCR_CLOCK: {
+      int count = wifi_portal_get_entity_count();
+      if (dir == LV_DIR_LEFT && count > 1) {
+        g_currentEntityIdx = (g_currentEntityIdx + 1) % count;
+        update_entity_ui();
+      } else if (dir == LV_DIR_RIGHT && count > 1) {
+        g_currentEntityIdx = (g_currentEntityIdx - 1 + count) % count;
+        update_entity_ui();
+      } else if (dir == LV_DIR_TOP) {
+        switch_screen(SCR_SETUP);
+      } else if (dir == LV_DIR_BOTTOM) {
+        // Deliberately straight to MONITOR, not via SCR_SETUP first: SETUP
+        // always tears down the STA connection to start its own AP (see
+        // setup_screen_on_enter()), so routing both directions through it
+        // would mean MONITOR could never find an existing WiFi connection
+        // to serve over - it'd always hit its own-AP fallback too, even
+        // when perfectly good STA connectivity already existed (confirmed
+        // on real hardware: this was exactly why the "remote setup" page
+        // kept being unreachable at its real LAN IP).
+        switch_screen(SCR_MONITOR);
+      }
       break;
+    }
     case SCR_SETUP:
     case SCR_MONITOR:
-      // Any direction goes back to CLOCK - LEFT/RIGHT swipes keep coming
-      // out classified as TOP/BOTTOM on this touch panel (see the
-      // [GESTURE] log from testing), so requiring a specific direction
-      // never worked reliably.
-      if (dir != LV_DIR_NONE) switch_screen(SCR_CLOCK);
+      if (dir == LV_DIR_TOP || dir == LV_DIR_BOTTOM) {
+        // Only two screens in this group - either direction just toggles
+        // to the other one (a real "rotation" once/if a third one joins).
+        switch_screen(current_screen == SCR_SETUP ? SCR_MONITOR : SCR_SETUP);
+      } else if (dir == LV_DIR_LEFT || dir == LV_DIR_RIGHT) {
+        switch_screen(SCR_CLOCK);
+      }
       break;
   }
+}
+
+// ====== CLOCK screen hook ======
+// Guards against g_currentEntityIdx having gone stale while away from
+// CLOCK - e.g. the owner removed entities on the setup page, shrinking the
+// list below the previously-selected index. Also covers the very first
+// entry into CLOCK from setup(), where update_entity_ui() hasn't run yet.
+static void clock_screen_on_enter()
+{
+  int count = wifi_portal_get_entity_count();
+  if (count <= 0) g_currentEntityIdx = 0;
+  else if (g_currentEntityIdx >= count) g_currentEntityIdx = count - 1;
+  else if (g_currentEntityIdx < 0) g_currentEntityIdx = 0;
+  update_entity_ui();
 }
 
 // ====== SETUP / MONITOR screen hooks ======
@@ -578,15 +715,21 @@ static void monitor_screen_on_enter()
 
 static void monitor_screen_on_leave()
 {
-  bool wasOwnAp = wifi_monitor_using_own_ap();
-  wifi_monitor_stop();
-
-  if (wasOwnAp && wifi_portal_has_credentials()) wifi_begin_nonblocking();
+  if (wifi_monitor_using_own_ap()) {
+    // Was serving via this device's own fallback AP (no STA connection
+    // available) - tear that down and try to reconnect to the real
+    // network now that the owner has left the screen.
+    wifi_monitor_stop();
+    if (wifi_portal_has_credentials()) wifi_begin_nonblocking();
+  }
+  // else: serving directly over an existing STA connection - leave it
+  // running in the background (see wifi_ntp_update_state()) so the setup
+  // page stays reachable from any screen, not just while physically on
+  // REMOTE SETUP.
 }
 
 // ====== Touch (FT3168) ======
-static FT3168 tp(I2C_SDA_PIN, I2C_SCL_PIN, -1, -1);
-
+// tp itself is declared earlier.
 static bool     g_touchActive     = false; // debounced "is a touch session ongoing" - see note below
 static uint32_t g_lastPressSeenMs = 0;
 static lv_coord_t g_touchFx = 0, g_touchFy = 0;
@@ -673,16 +816,24 @@ void setup()
                 psramFound(), (unsigned)ESP.getPsramSize(), (unsigned)ESP.getFreePsram(),
                 (unsigned)ESP.getFreeHeap());
 
-  // Deep sleep wakes are a full chip reset, not a resume - if this boot
-  // was caused by the touch controller pulling TP_INT low, mark the
-  // display as still "asleep" so touch_read_cb()'s existing wake-swallow
-  // logic (see below) treats the very first touch reading the same way
-  // it already treats a wake from dim/blank: it just wakes the screen,
-  // it doesn't also land a click on whatever's now underneath the finger.
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_EXT0) {
-    Serial.println("[BOOT] Woke from deep sleep via touch (GPIO18)");
-    disp_power_state = DisplayPowerState::BLANK;
+  // Diagnostic: print the actual reset reason by name - a crash
+  // (PANIC/WDT) or brownout looks very different from a normal power-on.
+  esp_reset_reason_t resetReason = esp_reset_reason();
+  const char* resetReasonStr = "UNKNOWN";
+  switch (resetReason) {
+    case ESP_RST_POWERON:   resetReasonStr = "POWERON"; break;
+    case ESP_RST_EXT:       resetReasonStr = "EXT (reset pin/button)"; break;
+    case ESP_RST_SW:        resetReasonStr = "SW (esp_restart)"; break;
+    case ESP_RST_PANIC:     resetReasonStr = "PANIC (crash)"; break;
+    case ESP_RST_INT_WDT:   resetReasonStr = "INT_WDT"; break;
+    case ESP_RST_TASK_WDT:  resetReasonStr = "TASK_WDT"; break;
+    case ESP_RST_WDT:       resetReasonStr = "WDT (other)"; break;
+    case ESP_RST_DEEPSLEEP: resetReasonStr = "DEEPSLEEP"; break;
+    case ESP_RST_BROWNOUT:  resetReasonStr = "BROWNOUT (power sag!)"; break;
+    case ESP_RST_SDIO:      resetReasonStr = "SDIO"; break;
+    default: break;
   }
+  Serial.printf("[BOOT] reset_reason=%s\n", resetReasonStr);
 
   if (!display_init()) {
     Serial.println("[BOOT] FATAL: display_init() failed - halting");
@@ -714,6 +865,14 @@ void setup()
   for (auto* scr : screens) {
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_add_event_cb(scr, gesture_event_cb, LV_EVENT_GESTURE, nullptr);
+    // lv_obj_create() is scrollable by default in both axes - a drag is
+    // only promoted to a bubbled LV_EVENT_GESTURE once LVGL decides the
+    // pressed object can't itself scroll further in that direction.
+    // Confirmed on real hardware: horizontal swipes were producing zero
+    // [GESTURE] events at all (not even misclassified - just absorbed),
+    // while vertical ones worked, which matches this being treated as a
+    // no-op horizontal scroll of the screen itself rather than a gesture.
+    lv_obj_clear_flag(scr, LV_OBJ_FLAG_SCROLLABLE);
   }
 
   // ===== CLOCK screen =====
@@ -735,17 +894,47 @@ void setup()
   lv_obj_set_style_text_font(clock_battery, &lv_font_montserrat_20, 0);
   lv_obj_align(clock_battery, LV_ALIGN_TOP_RIGHT, -8, 8);
 
+  // Setup/config web page reachable (wifi_monitor_is_active()) - gear icon,
+  // since that's literally the setup page's own connectivity, not the
+  // general WiFi-association icon (clock_wifi) above.
+  clock_srv_icon = lv_label_create(scr_clock);
+  lv_label_set_text(clock_srv_icon, LV_SYMBOL_SETTINGS);
+  lv_obj_set_style_text_font(clock_srv_icon, &lv_font_montserrat_20, 0);
+  lv_obj_align(clock_srv_icon, LV_ALIGN_TOP_MID, -15, 8);
+
+  // Last Home Assistant poll result (g_haLastPollOk, see update_entity_ui()
+  // and the periodic poll in loop()) - house icon for "Home" Assistant.
+  clock_ha_icon = lv_label_create(scr_clock);
+  lv_label_set_text(clock_ha_icon, LV_SYMBOL_HOME);
+  lv_obj_set_style_text_font(clock_ha_icon, &lv_font_montserrat_20, 0);
+  lv_obj_align(clock_ha_icon, LV_ALIGN_TOP_MID, 15, 8);
+
   clock_time = lv_label_create(scr_clock);
   lv_obj_set_style_text_color(clock_time, lv_color_white(), 0);
   lv_obj_set_style_text_font(clock_time, &lv_font_montserrat_48, 0);
   lv_label_set_text(clock_time, "--:--");
-  lv_obj_align(clock_time, LV_ALIGN_CENTER, 0, -90);
+  lv_obj_align(clock_time, LV_ALIGN_CENTER, 0, -130);
 
   clock_date = lv_label_create(scr_clock);
   lv_obj_set_style_text_color(clock_date, lv_color_white(), 0);
   lv_obj_set_style_text_font(clock_date, &lv_font_montserrat_22, 0);
   lv_label_set_text(clock_date, "----------");
-  lv_obj_align(clock_date, LV_ALIGN_CENTER, 0, -30);
+  lv_obj_align(clock_date, LV_ALIGN_CENTER, 0, -85);
+
+  // Currently-selected carousel entity's name - between the date and the
+  // button, text set for real by update_entity_ui()/clock_screen_on_enter()
+  // further down, not here. font_pl_34 (src/font_pl_34.c, generated from
+  // LVGL's own bundled Montserrat-Medium.ttf via lv_font_conv - same source
+  // the stock lv_font_montserrat_* built-ins use, so it matches visually)
+  // adds the Polish diacritics (Ą Ć Ę Ł Ń Ó Ś Ź Ż and lowercase) that none
+  // of LVGL's built-in fonts include (ASCII + Latin-1 only) - needed since
+  // entity names are free-text and this project's whole audience is Polish.
+  clock_entity_name_lbl = lv_label_create(scr_clock);
+  lv_obj_set_style_text_color(clock_entity_name_lbl, ral7037(), 0);
+  lv_obj_set_style_text_font(clock_entity_name_lbl, &font_pl_34, 0);
+  lv_obj_set_style_text_align(clock_entity_name_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(clock_entity_name_lbl, "");
+  lv_obj_align(clock_entity_name_lbl, LV_ALIGN_CENTER, 0, -5);
 
   // Home Assistant light-switch button - large rounded bar (not a small
   // circle) so it's forgiving of this touch panel's real-world jitter/
@@ -763,9 +952,23 @@ void setup()
   lv_obj_set_style_radius(clock_light_btn, 24, 0);
   lv_obj_set_style_border_width(clock_light_btn, 0, 0);
   lv_obj_align(clock_light_btn, LV_ALIGN_CENTER, 0, 100);
+  // lv_btn_create() is scrollable by default too - without clearing this,
+  // a swipe starting on the button (a large, central target most swipes
+  // will cross) could get absorbed as the button's own no-op scroll
+  // instead of ever reaching GESTURE_BUBBLE below. Same fix as the
+  // screens themselves, see that comment for the real-hardware symptom.
+  lv_obj_clear_flag(clock_light_btn, LV_OBJ_FLAG_SCROLLABLE);
+  // GESTURE_BUBBLE alone is enough - it re-fires LV_EVENT_GESTURE on
+  // scr_clock, which already has gesture_event_cb registered (see the
+  // shared screens loop above). Also registering gesture_event_cb directly
+  // on the button double-fired every swipe that started on it (button's own
+  // callback, then again via the bubble to the screen) - harmless for the
+  // old switch_screen() calls (re-entering the same screen is a no-op) but
+  // silently cancelled out entity-carousel rotation: idx+1 immediately
+  // followed by idx-1 nets to no visible change, which is exactly the
+  // "left/right does nothing on CLOCK" symptom seen on real hardware.
   lv_obj_add_flag(clock_light_btn, LV_OBJ_FLAG_GESTURE_BUBBLE);
   lv_obj_add_event_cb(clock_light_btn, ha_light_btn_cb, LV_EVENT_CLICKED, nullptr);
-  lv_obj_add_event_cb(clock_light_btn, gesture_event_cb, LV_EVENT_GESTURE, nullptr);
 
   clock_light_icon = lv_label_create(clock_light_btn);
   lv_label_set_text(clock_light_icon, LV_SYMBOL_POWER);
@@ -813,13 +1016,21 @@ void setup()
   lv_obj_t* setupHint3 = lv_label_create(scr_setup);
   lv_obj_set_style_text_color(setupHint3, ral7037(), 0);
   lv_obj_set_style_text_align(setupHint3, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_text(setupHint3, "Swipe: back to clock");
+  // Plain ASCII on purpose - lv_font_montserrat_* only ships common Latin
+  // glyphs by default, and an unsupported character (e.g. a Unicode bullet)
+  // would just render as a blank tofu box.
+  lv_label_set_text(setupHint3, "Swipe left/right: clock | up/down: remote setup");
   lv_obj_align(setupHint3, LV_ALIGN_BOTTOM_MID, 0, -20);
 
   // ===== MONITOR screen port =====
+  // Renamed from "REMOTE MONITOR" - this screen has only ever been remote
+  // access to the same setup page (see wifi_monitor_start() in
+  // wifi_portal.cpp), not a status/telemetry monitor; the old name was a
+  // leftover from this project's TiltDash origins (see main.cpp's header
+  // comment) and didn't match what the user now calls it either.
   lv_obj_t* monitorTitle = lv_label_create(scr_monitor);
   lv_obj_set_style_text_color(monitorTitle, lv_color_white(), 0);
-  lv_label_set_text(monitorTitle, "REMOTE MONITOR");
+  lv_label_set_text(monitorTitle, "REMOTE SETUP");
   lv_obj_align(monitorTitle, LV_ALIGN_TOP_MID, 0, 20);
 
   monitor_status_lbl = lv_label_create(scr_monitor);
@@ -837,13 +1048,20 @@ void setup()
   lv_obj_t* monitorHint = lv_label_create(scr_monitor);
   lv_obj_set_style_text_color(monitorHint, ral7037(), 0);
   lv_obj_set_style_text_align(monitorHint, LV_TEXT_ALIGN_CENTER, 0);
-  lv_label_set_text(monitorHint, "Swipe: back to clock");
+  lv_label_set_text(monitorHint, "Swipe left/right: clock | up/down: wifi setup");
   lv_obj_align(monitorHint, LV_ALIGN_BOTTOM_MID, 0, -20);
 
   lv_scr_load(scr_clock);
 
   wifi_portal_init();
   Serial.printf("[BOOT] Applying saved tz offset: %d min\n", wifi_portal_get_tz_offset_min());
+
+  // scr_clock was lv_scr_load()'ed directly above (not via switch_screen()),
+  // so its on-enter hook never ran - do it once explicitly now that
+  // wifi_portal_init() has populated the entity list, to set the initial
+  // name label/button state instead of leaving them at their placeholder
+  // creation-time values until the first swipe.
+  clock_screen_on_enter();
 
   if (!wifi_portal_has_credentials()) {
     // No saved network - go straight into setup mode instead of waiting
@@ -861,6 +1079,7 @@ void loop()
   lv_timer_handler();
   updateDisplayPower();
 
+
   if (wifi_portal_is_active()) {
     // WiFi configuration mode (AP + captive portal) - the normal WiFi/NTP
     // state machine is irrelevant here (and would conflict with AP mode).
@@ -870,15 +1089,41 @@ void loop()
     // Remote monitor serving directly over an existing STA connection (no
     // AP involved, so it isn't covered by wifi_portal_loop() above).
     if (wifi_monitor_is_active()) wifi_monitor_service();
+    ota_loop();
   }
 
   uint32_t now = millis();
+
+  // Diagnostic: while on SETUP/MONITOR, log the actual live network state
+  // every 500ms - added specifically to see what's happening moment-to-
+  // moment during real-hardware debugging of the setup web page's
+  // reachability, instead of only finding out via a failed browser/curl
+  // request after the fact. Safe to remove once that's no longer needed.
+  static uint32_t lastNetDiag = 0;
+  if ((current_screen == SCR_SETUP || current_screen == SCR_MONITOR) && now - lastNetDiag >= 500) {
+    lastNetDiag = now;
+    Serial.printf(
+      "[NETDIAG] screen=%d wifiStatus=%d ip=%s apActive=%d monitorActive=%d monitorOwnAp=%d heapFree=%u\n",
+      (int)current_screen, (int)WiFi.status(), WiFi.localIP().toString().c_str(),
+      (int)wifi_portal_is_active(), (int)wifi_monitor_is_active(), (int)wifi_monitor_using_own_ap(),
+      (unsigned)ESP.getFreeHeap());
+  }
 
   static uint32_t lastClock = 0;
   if (now - lastClock >= 1000) {
     lastClock = now;
     if (clock_wifi)    lv_obj_set_style_opa(clock_wifi, g_wifiOk ? LV_OPA_COVER : (((now / 500) % 2) ? LV_OPA_COVER : LV_OPA_0), 0);
     if (clock_offline) lv_obj_set_style_opa(clock_offline, g_wifiOk ? LV_OPA_0 : LV_OPA_COVER, 0);
+
+    if (clock_srv_icon) {
+      lv_obj_set_style_text_color(clock_srv_icon,
+        wifi_monitor_is_active() ? lv_color_hex(0x40C0FF) : lv_color_hex(0x444444), 0);
+    }
+    if (clock_ha_icon) {
+      bool haOk = wifi_portal_has_ha_config() && g_haLastPollOk;
+      lv_obj_set_style_text_color(clock_ha_icon,
+        haOk ? lv_color_hex(0x40FF80) : lv_color_hex(0x444444), 0);
+    }
 
     if (clock_battery) {
       float vbat = readBatteryVoltage();
@@ -945,7 +1190,9 @@ void loop()
     if (current_screen == SCR_CLOCK && wifi_portal_has_ha_config() && (now - lastHaPoll) >= 5000) {
       lastHaPoll = now;
       bool isOn = g_haLightOn;
-      if (ha_light_poll_state(&isOn) && isOn != g_haLightOn) {
+      bool pollOk = ha_light_poll_state(wifi_portal_get_entity_id(g_currentEntityIdx), &isOn);
+      g_haLastPollOk = pollOk;
+      if (pollOk && isOn != g_haLightOn) {
         g_haLightOn = isOn;
         update_light_btn_style();
       }
