@@ -515,6 +515,10 @@ static lv_obj_t* monitor_address_lbl = nullptr;
 static lv_obj_t* update_version_lbl = nullptr;
 static lv_obj_t* update_status_lbl  = nullptr;
 static lv_obj_t* update_btn         = nullptr;
+// Set by update_btn's tap handler, consumed in loop() right after that
+// frame's lv_timer_handler() call returns - see the handler's own comment
+// for why it can't just call update_perform() directly.
+static bool      g_updateRequested  = false;
 
 
 // Forward declarations - switch_screen() calls these, but they're defined
@@ -969,6 +973,7 @@ void setup()
   // to SCR_UPDATE (not a swipe target - see the Screen enum comment).
   clock_update_icon = lv_label_create(scr_clock);
   lv_label_set_text(clock_update_icon, LV_SYMBOL_DOWNLOAD);
+  lv_obj_set_style_text_color(clock_update_icon, lv_color_hex(0xFFA500), 0); // match clock_update_text's orange
   lv_obj_set_style_text_font(clock_update_icon, &lv_font_montserrat_20, 0);
   lv_obj_align(clock_update_icon, LV_ALIGN_TOP_MID, 30, 8);
   lv_obj_add_flag(clock_update_icon, LV_OBJ_FLAG_CLICKABLE);
@@ -1153,20 +1158,22 @@ void setup()
   lv_label_set_text(updateBtnLbl, "Update now");
   lv_obj_center(updateBtnLbl);
   lv_obj_add_event_cb(update_btn, [](lv_event_t*) {
+    // Just requests the update and sets the label text here - does NOT
+    // call update_perform() (or lv_timer_handler()) directly. This
+    // callback is itself invoked FROM INSIDE the main loop()'s own
+    // lv_timer_handler() call (that's how LVGL dispatches the click in
+    // the first place) - LVGL doesn't support being re-entered like that,
+    // so a previous attempt that called lv_timer_handler() again right
+    // here never actually got the "Downloading..." text drawn on real
+    // hardware (confirmed: the label text change here only gets queued;
+    // it's not flushed to the panel until the CURRENT lv_timer_handler()
+    // call finishes normally and a later one runs). g_updateRequested is
+    // instead picked up in loop(), right after that in-progress
+    // lv_timer_handler() call has returned and genuinely rendered this
+    // text - only then is it safe to block on the download.
     if (!update_is_available()) return;
     if (update_status_lbl) lv_label_set_text(update_status_lbl, "Downloading...");
-    // A single lv_timer_handler() call only *queues* the redraw - the
-    // actual pixels reach the panel asynchronously via DMA (see
-    // notify_lvgl_flush_ready()), so calling update_perform() (which
-    // blocks for the whole download) immediately after one call raced
-    // right past the flush and the text never visibly appeared on real
-    // hardware. A few calls with a short delay between them give the
-    // transfer time to actually finish before the UI freezes.
-    for (int i = 0; i < 5; i++) { lv_timer_handler(); delay(20); }
-    bool ok = update_perform(); // blocks; on success this restarts the device and never returns
-    if (update_status_lbl) {
-      lv_label_set_text(update_status_lbl, ok ? "Done." : "Update failed - see serial log.");
-    }
+    g_updateRequested = true;
   }, LV_EVENT_CLICKED, nullptr);
 
   update_status_lbl = lv_label_create(scr_update);
@@ -1210,6 +1217,18 @@ void loop()
 {
   lv_timer_handler();
   updateDisplayPower();
+
+  // See update_btn's tap handler comment: this runs only after the
+  // lv_timer_handler() call above has returned, so "Downloading..." (set
+  // by that handler) has genuinely been rendered before update_perform()
+  // blocks the loop for the whole download.
+  if (g_updateRequested) {
+    g_updateRequested = false;
+    bool ok = update_perform(); // blocks; on success this restarts the device and never returns
+    if (update_status_lbl) {
+      lv_label_set_text(update_status_lbl, ok ? "Done." : "Update failed - see serial log.");
+    }
+  }
 
 
   if (wifi_portal_is_active()) {
