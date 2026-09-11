@@ -485,6 +485,13 @@ static lv_obj_t* clock_light_btn  = nullptr;
 static lv_obj_t* clock_light_icon = nullptr;
 static bool g_haLightOn = false;
 
+// Read-only display for a "weather.*" carousel entry (see
+// ha_light_is_weather()) - shown instead of clock_light_btn for that
+// entry, toggled by update_entity_ui(). No tap action; nothing to toggle.
+static lv_obj_t* clock_weather_temp_lbl = nullptr;
+static lv_obj_t* clock_weather_cond_lbl = nullptr;
+static lv_obj_t* clock_weather_wind_lbl = nullptr;
+
 // Small persistent dev overlay at the bottom of CLOCK only - not part of
 // the real screen, kept as a quick sanity check that touch is still
 // alive while iterating on the rest of the port.
@@ -586,6 +593,64 @@ static void update_light_btn_style()
 // label and immediately polls the newly-selected entity's real state,
 // rather than showing the previous entity's color until the next periodic
 // poll (up to 5s later, see loop()) catches up.
+// Shows either the toggle button (switch/light entities) or the read-only
+// weather labels (see clock_weather_*_lbl above) for the current carousel
+// entry - never both. clock_light_btn's CLICKABLE flag is toggled too
+// (not just visibility) so a hidden button can't leave an invisible tap
+// target sitting in the middle of the screen.
+static void set_clock_display_mode(bool isWeather)
+{
+  if (clock_light_btn) {
+    if (isWeather) {
+      lv_obj_add_flag(clock_light_btn, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_clear_flag(clock_light_btn, LV_OBJ_FLAG_CLICKABLE);
+    } else {
+      lv_obj_clear_flag(clock_light_btn, LV_OBJ_FLAG_HIDDEN);
+      lv_obj_add_flag(clock_light_btn, LV_OBJ_FLAG_CLICKABLE);
+    }
+  }
+  lv_obj_t* weatherLbls[] = {clock_weather_temp_lbl, clock_weather_cond_lbl, clock_weather_wind_lbl};
+  for (auto* lbl : weatherLbls) {
+    if (!lbl) continue;
+    if (isWeather) lv_obj_clear_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(lbl, LV_OBJ_FLAG_HIDDEN);
+  }
+}
+
+// Polls entityId (a "weather.*" entity) and fills in the temp/condition/
+// wind labels - or a "no data" placeholder on failure, same spirit as
+// update_light_btn_style() defaulting to the "off" visual on a failed
+// switch poll rather than leaving stale data on screen.
+static void update_weather_display(const char* entityId)
+{
+  HaWeather w;
+  if (ha_light_poll_weather(entityId, &w)) {
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%.1f%s", w.temperature, w.temperatureUnit[0] ? w.temperatureUnit : "\xC2\xB0" "C");
+    if (clock_weather_temp_lbl) lv_label_set_text(clock_weather_temp_lbl, buf);
+
+    String cond = w.condition;
+    if (cond.length() > 0) cond.setCharAt(0, (char)toupper((unsigned char)cond[0]));
+    if (clock_weather_cond_lbl) lv_label_set_text(clock_weather_cond_lbl, cond.c_str());
+
+    if (clock_weather_wind_lbl) {
+      if (w.windSpeedUnit[0]) {
+        char windBuf[32];
+        snprintf(windBuf, sizeof(windBuf), "Wind: %.0f %s", w.windSpeed, w.windSpeedUnit);
+        lv_label_set_text(clock_weather_wind_lbl, windBuf);
+      } else {
+        lv_label_set_text(clock_weather_wind_lbl, "");
+      }
+    }
+    g_haLastPollOk = true;
+  } else {
+    if (clock_weather_temp_lbl) lv_label_set_text(clock_weather_temp_lbl, "--");
+    if (clock_weather_cond_lbl) lv_label_set_text(clock_weather_cond_lbl, "No data");
+    if (clock_weather_wind_lbl) lv_label_set_text(clock_weather_wind_lbl, "");
+    g_haLastPollOk = false;
+  }
+}
+
 static void update_entity_ui()
 {
   if (!clock_entity_name_lbl) return;
@@ -593,16 +658,28 @@ static void update_entity_ui()
   int count = wifi_portal_get_entity_count();
   if (count <= 0) {
     lv_label_set_text(clock_entity_name_lbl, "No entity configured");
+    set_clock_display_mode(false);
     g_haLightOn = false;
     g_haLastPollOk = false;
     update_light_btn_style();
     return;
   }
 
+  const char* entityId = wifi_portal_get_entity_id(g_currentEntityIdx);
   lv_label_set_text(clock_entity_name_lbl, wifi_portal_get_entity_name(g_currentEntityIdx));
 
+  if (ha_light_is_weather(entityId)) {
+    set_clock_display_mode(true);
+    update_weather_display(entityId);
+    // update_light_btn_style() normally also colors the name label to
+    // match the entity - not called on this branch, so do it here too.
+    lv_obj_set_style_text_color(clock_entity_name_lbl, lv_color_hex(wifi_portal_get_entity_color(g_currentEntityIdx)), 0);
+    return;
+  }
+
+  set_clock_display_mode(false);
   bool isOn = false;
-  if (ha_light_poll_state(wifi_portal_get_entity_id(g_currentEntityIdx), &isOn)) {
+  if (ha_light_poll_state(entityId, &isOn)) {
     g_haLightOn = isOn;
     g_haLastPollOk = true;
   } else {
@@ -622,8 +699,12 @@ static void do_ha_light_toggle()
 {
   int count = wifi_portal_get_entity_count();
   if (count <= 0) return;
+  const char* entityId = wifi_portal_get_entity_id(g_currentEntityIdx);
+  // Defensive - shouldn't be reachable, since clock_light_btn is hidden
+  // and non-clickable for a weather entity (see set_clock_display_mode()).
+  if (ha_light_is_weather(entityId)) return;
 
-  bool ok = ha_light_toggle(wifi_portal_get_entity_id(g_currentEntityIdx));
+  bool ok = ha_light_toggle(entityId);
   if (ok) {
     // Optimistic flip for instant feedback - the next periodic poll (see
     // loop()) will correct this within a few seconds if the toggle
@@ -987,9 +1068,9 @@ void setup()
 
   clock_date = lv_label_create(scr_clock);
   lv_obj_set_style_text_color(clock_date, lv_color_white(), 0);
-  lv_obj_set_style_text_font(clock_date, &lv_font_montserrat_22, 0);
+  lv_obj_set_style_text_font(clock_date, &lv_font_montserrat_32, 0);
   lv_label_set_text(clock_date, "----------");
-  lv_obj_align(clock_date, LV_ALIGN_CENTER, 0, -85);
+  lv_obj_align(clock_date, LV_ALIGN_CENTER, 0, -82); // clock_time (-130) + 48px gap - same gap used for temp/cond/wind below
 
   // Currently-selected carousel entity's name - between the date and the
   // button, text set for real by update_entity_ui()/clock_screen_on_enter()
@@ -1057,6 +1138,34 @@ void setup()
   lv_obj_center(clock_light_icon);
 
   update_light_btn_style();
+
+  // Weather display - occupies the same screen region as clock_light_btn
+  // above, shown instead of it (never both at once) for a "weather.*"
+  // carousel entry - see update_entity_ui(). Hidden/non-clickable by
+  // default; nothing to tap here regardless, so no event callbacks.
+  clock_weather_temp_lbl = lv_label_create(scr_clock);
+  lv_obj_set_style_text_color(clock_weather_temp_lbl, lv_color_white(), 0);
+  lv_obj_set_style_text_font(clock_weather_temp_lbl, &lv_font_montserrat_48, 0);
+  lv_obj_set_style_text_align(clock_weather_temp_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(clock_weather_temp_lbl, "");
+  lv_obj_align(clock_weather_temp_lbl, LV_ALIGN_CENTER, 0, 60);
+  lv_obj_add_flag(clock_weather_temp_lbl, LV_OBJ_FLAG_HIDDEN);
+
+  clock_weather_cond_lbl = lv_label_create(scr_clock);
+  lv_obj_set_style_text_color(clock_weather_cond_lbl, lv_color_white(), 0);
+  lv_obj_set_style_text_font(clock_weather_cond_lbl, &lv_font_montserrat_32, 0);
+  lv_obj_set_style_text_align(clock_weather_cond_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(clock_weather_cond_lbl, "");
+  lv_obj_align(clock_weather_cond_lbl, LV_ALIGN_CENTER, 0, 108); // 60 + 48px gap, same as clock_time->clock_date
+  lv_obj_add_flag(clock_weather_cond_lbl, LV_OBJ_FLAG_HIDDEN);
+
+  clock_weather_wind_lbl = lv_label_create(scr_clock);
+  lv_obj_set_style_text_color(clock_weather_wind_lbl, ral7037(), 0);
+  lv_obj_set_style_text_font(clock_weather_wind_lbl, &lv_font_montserrat_22, 0);
+  lv_obj_set_style_text_align(clock_weather_wind_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(clock_weather_wind_lbl, "");
+  lv_obj_align(clock_weather_wind_lbl, LV_ALIGN_CENTER, 0, 156); // 108 + 48px gap, same as the two gaps above
+  lv_obj_add_flag(clock_weather_wind_lbl, LV_OBJ_FLAG_HIDDEN);
 
   lblTouch = lv_label_create(scr_clock);
   lv_obj_set_style_text_color(lblTouch, lv_color_make(90, 90, 90), 0);
@@ -1357,12 +1466,17 @@ void loop()
     static uint32_t lastHaPoll = 0;
     if (current_screen == SCR_CLOCK && wifi_portal_has_ha_config() && (now - lastHaPoll) >= 5000) {
       lastHaPoll = now;
-      bool isOn = g_haLightOn;
-      bool pollOk = ha_light_poll_state(wifi_portal_get_entity_id(g_currentEntityIdx), &isOn);
-      g_haLastPollOk = pollOk;
-      if (pollOk && isOn != g_haLightOn) {
-        g_haLightOn = isOn;
-        update_light_btn_style();
+      const char* entityId = wifi_portal_get_entity_id(g_currentEntityIdx);
+      if (ha_light_is_weather(entityId)) {
+        update_weather_display(entityId);
+      } else {
+        bool isOn = g_haLightOn;
+        bool pollOk = ha_light_poll_state(entityId, &isOn);
+        g_haLastPollOk = pollOk;
+        if (pollOk && isOn != g_haLightOn) {
+          g_haLightOn = isOn;
+          update_light_btn_style();
+        }
       }
     }
 

@@ -94,6 +94,12 @@ to it and open `http://192.168.4.1` - from there you can:
 4. Save. On the clock screen, swipe left/right to cycle entities, tap the
    button to toggle.
 
+Any entity whose ID starts with `weather.` (Home Assistant's built-in
+Weather integration) is detected automatically and shown read-only instead
+- temperature, condition, and wind speed, no toggle button - so you can
+  add e.g. `weather.home` as one of the 6 slots to get an at-a-glance
+  weather screen alongside your switches, no extra hardware needed.
+
 ### Remote setup access
 
 Once connected to WiFi, swipe down from the clock screen to reach **REMOTE

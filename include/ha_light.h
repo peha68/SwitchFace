@@ -22,3 +22,29 @@ bool ha_light_toggle(const char* entityId);
 // Blocking HTTP call - call it periodically (e.g. every few seconds), not
 // every frame.
 bool ha_light_poll_state(const char* entityId, bool* outIsOn);
+
+// ====== Weather entities (read-only - no toggle/button) ======
+// A "weather.*" entity (e.g. Home Assistant's built-in Weather
+// integration) has a completely different shape than a switch/light: its
+// `state` is a condition string ("cloudy", "rainy", ...), and the actual
+// numbers live in `attributes` (temperature, wind_speed, etc.) rather than
+// state itself. Kept as a separate, parallel API rather than folding into
+// ha_light_poll_state() - the parsing and the data returned are unrelated
+// to on/off.
+
+// True if entityId's domain (the part before '.') is "weather" - used by
+// main.cpp to decide whether to show the toggle button or a read-only
+// display for the current carousel entry.
+bool ha_light_is_weather(const char* entityId);
+
+struct HaWeather {
+    float temperature;         // degrees, in whatever unit HA is configured for
+    char  temperatureUnit[8];  // e.g. "\xc2\xb0C" (UTF-8 for U+00B0 C) - HA's own attribute, not assumed
+    char  condition[24];       // HA's raw condition string (e.g. "cloudy") - shown as-is, not translated/iconified
+    float windSpeed;
+    char  windSpeedUnit[12];   // e.g. "km/h"
+};
+
+// Blocking HTTP call, same pattern/caveats as ha_light_poll_state(). Only
+// touches *out on success.
+bool ha_light_poll_weather(const char* entityId, HaWeather* out);
