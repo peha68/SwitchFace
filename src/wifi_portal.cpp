@@ -61,6 +61,10 @@ static constexpr int DEFAULT_ENTITY_COLORS_COUNT = sizeof(DEFAULT_ENTITY_COLORS)
 // OTA (firmware-over-WiFi) password - see ota.cpp. Empty = unprotected.
 static String g_otaPassword;
 
+// Global toggle: apply the entity's identity color to the CLOCK button's
+// background too (name label always shows it regardless). Default true.
+static bool g_colorButton = true;
+
 // Curated list of real-world UTC offsets (minutes) for the setup page's
 // timezone <select> - deliberately not every 15-minute step from -12:00
 // to +14:00, since most of those don't correspond to an actual timezone.
@@ -374,6 +378,8 @@ static void handleRoot()
             "background:#111;color:#eee;border:1px solid #333;border-radius:8px;font-size:15px}"
             "select:focus,input:focus{outline:none;border-color:#7b7d7d}"
             "input[type=color]{width:56px;padding:4px;height:40px}"
+            "label.checkbox{display:flex;align-items:center;gap:8px;margin-top:14px}"
+            "input[type=checkbox]{width:20px;height:20px;flex:none;margin:0}"
             "button{width:100%;padding:13px;margin-top:16px;background:#7b7d7d;color:#111;"
             "border:none;border-radius:8px;font-size:15px;font-weight:600}"
             "button.secondary{background:transparent;color:#ccc;border:1px solid #333;margin-top:8px}"
@@ -450,7 +456,12 @@ static void handleRoot()
                 "<input type='text' name='entity_id_" + String(i) + "' maxlength='64' value='"
                 + htmlEscape(entityId) + "'>";
     }
-    page += "<button type='submit'>Save Home Assistant config</button>"
+    page += "<label class='checkbox'>"
+            "<input type='checkbox' name='color_button'"
+            + String(g_colorButton ? " checked" : "") + ">"
+            "Also color the button background (name is always colored)"
+            "</label>"
+            "<button type='submit'>Save Home Assistant config</button>"
             "</form>"
             "</div>"
             "<div class='card'>"
@@ -613,13 +624,20 @@ static void handleSaveHa()
     g_haEntityCount = parsedCount;
     String entitiesRaw = serializeEntities();
 
+    // Checkboxes only appear in the POST body when checked - hasArg(), not
+    // arg(), is the correct way to read one (arg() would return "" either
+    // way and be indistinguishable from "unchecked").
+    bool colorButton = server.hasArg("color_button");
+
     prefsWifi.begin(NVS_NAMESPACE, false);
     prefsWifi.putString("ha_url", url);
     prefsWifi.putString("ha_token", token);
     prefsWifi.putString("ha_entities", entitiesRaw);
+    prefsWifi.putBool("color_btn", colorButton);
     prefsWifi.end();
     g_haUrl = url;
     g_haToken = token;
+    g_colorButton = colorButton;
 
     server.sendHeader("Connection", "close");
     server.send(200, "text/html",
@@ -699,6 +717,7 @@ void wifi_portal_init()
     g_haToken     = prefsWifi.getString("ha_token", "");
     deserializeEntities(prefsWifi.getString("ha_entities", ""));
     g_otaPassword = prefsWifi.getString("ota_pass", "");
+    g_colorButton = prefsWifi.getBool("color_btn", true);
     prefsWifi.end();
 }
 
@@ -730,6 +749,8 @@ uint32_t wifi_portal_get_entity_color(int index)
 }
 
 const char* wifi_portal_get_ota_password() { return g_otaPassword.c_str(); }
+
+bool wifi_portal_get_color_button() { return g_colorButton; }
 
 const char* wifi_portal_get_device_name() { return g_deviceName.c_str(); }
 

@@ -102,12 +102,15 @@ putting the device back into hotspot mode.
 
 ### OTA updates
 
-With the device on WiFi (and an OTA password set, if you configured one):
+With the device on WiFi (and an OTA password set on the setup page - use
+the dedicated environment below, which reads it from an environment
+variable so it's never written to a file or committed):
 
 ```bash
-pio run -t upload --upload-port <device-ip-or-hostname.local>
+OTA_PASSWORD=<your password> pio run -e esp32-s3-devkitc-1-ota -t upload --upload-port <device-ip-or-hostname.local>
 ```
 
+Confirmed working end-to-end on real hardware (~75s for a full upload).
 The screen will visibly stutter during the actual firmware write - that's
 inherent to `ArduinoOTA` (its progress callback runs synchronously), not a
 hang; don't power-cycle mid-update.

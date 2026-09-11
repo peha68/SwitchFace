@@ -534,9 +534,19 @@ static void update_light_btn_style()
 {
   if (!clock_light_btn) return;
   lv_color_t entityColor = lv_color_hex(wifi_portal_get_entity_color(g_currentEntityIdx));
-  lv_color_t bg = g_haLightOn ? entityColor : lv_color_darken(entityColor, LV_OPA_70);
-  lv_obj_set_style_bg_color(clock_light_btn, bg, 0);
-  lv_obj_set_style_text_color(clock_light_icon, g_haLightOn ? lv_color_black() : lv_color_white(), 0);
+
+  // The button background follows wifi_portal_get_color_button() - the
+  // name label (below) always shows the identity color regardless, that
+  // toggle only affects the (much bigger, so higher-contrast) button.
+  if (wifi_portal_get_color_button()) {
+    lv_color_t bg = g_haLightOn ? entityColor : lv_color_darken(entityColor, LV_OPA_70);
+    lv_obj_set_style_bg_color(clock_light_btn, bg, 0);
+    lv_obj_set_style_text_color(clock_light_icon, g_haLightOn ? lv_color_black() : lv_color_white(), 0);
+  } else {
+    lv_obj_set_style_bg_color(clock_light_btn, g_haLightOn ? lv_color_hex(0xFFC107) : lv_color_hex(0x333333), 0);
+    lv_obj_set_style_text_color(clock_light_icon, g_haLightOn ? lv_color_black() : lv_color_hex(0x888888), 0);
+  }
+
   if (clock_entity_name_lbl) lv_obj_set_style_text_color(clock_entity_name_lbl, entityColor, 0);
 }
 

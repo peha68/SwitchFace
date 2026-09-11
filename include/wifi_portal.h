@@ -60,6 +60,13 @@ const char* wifi_portal_get_entity_id(int index);
 // wifi_portal.cpp) until the owner picks their own on the setup page.
 uint32_t wifi_portal_get_entity_color(int index);
 
+// Whether the entity's identity color is ALSO applied to the CLOCK
+// button's background (the name label always shows it regardless of this
+// setting). One global toggle, not per-entity - configurable from a
+// checkbox in the Home Assistant card on the setup page. Defaults to true
+// (the original behavior).
+bool wifi_portal_get_color_button();
+
 // OTA (firmware-over-WiFi) password - empty means unprotected. Configurable
 // from its own card on the setup page; takes effect on next boot (saving it
 // restarts the device, same as WiFi/timezone saves).
