@@ -115,6 +115,41 @@ The screen will visibly stutter during the actual firmware write - that's
 inherent to `ArduinoOTA` (its progress callback runs synchronously), not a
 hang; don't power-cycle mid-update.
 
+### Automatic updates (GitHub Releases)
+
+The device can also find, verify, and install new versions entirely on its
+own, with no computer involved:
+
+1. **Publishing a release is one command:**
+   ```bash
+   git tag v1.2.3 && git push --tags
+   ```
+   `.github/workflows/release.yml` builds the firmware and publishes a
+   GitHub Release with `firmware.bin` attached and its SHA256 in the
+   release notes - nothing to build or upload by hand.
+2. The device checks `api.github.com/repos/peha68/SwitchFace/releases/
+   latest` once per WiFi connection. When the published tag differs from
+   its own version (embedded from `git describe` at build time - see
+   `scripts/get_version.py`), a small download icon lights up on the
+   CLOCK screen's top row.
+3. Tap it to reach the **FIRMWARE UPDATE** screen (current/latest version,
+   an "Update now" button) - or use the **Firmware** card on the setup web
+   page instead, with a "Check now" and "Update now" button there too.
+   Either one downloads, verifies, and flashes the same way.
+
+**Security note:** the release-check API call is TLS-certificate-pinned
+(GitHub's current root CA is embedded in `src/update_check.cpp`). The
+firmware *binary* download is not - it redirects through GitHub's asset
+CDN, whose hostname/CA has changed more than once over the years, and
+pinning it would mean updates silently stop working whenever that
+infrastructure changes again, with no fix short of a USB reflash. Instead,
+every downloaded byte is SHA256-hashed and checked against the hash from
+the cert-validated API response *before* the new image is ever finalized -
+a corrupted or spoofed download fails that check and is aborted, leaving
+the currently-running firmware untouched (the existing `ota_0`/`ota_1`
+dual-partition scheme makes this safe: a failed update just never becomes
+the boot partition).
+
 ## Screens & gestures
 
 | Screen | Swipe LEFT / RIGHT | Swipe UP | Swipe DOWN |
@@ -128,23 +163,32 @@ active) - it's the on-device provisioning screen. REMOTE SETUP serves the
 same config page directly over an existing WiFi connection when there is
 one, falling back to its own hotspot only if there isn't.
 
+A fifth screen, **FIRMWARE UPDATE**, isn't part of either rotation above -
+it only appears by tapping the download icon on CLOCK (visible only when
+an update is actually available), and any swipe from it returns to CLOCK.
+
 ## Project layout
 
 ```
 SwitchFace/
+├── .github/workflows/
+│   └── release.yml          # Builds + publishes a GitHub Release on every `git tag v*` push
+├── scripts/
+│   └── get_version.py       # PlatformIO pre-build step: embeds `git describe` as FIRMWARE_VERSION
 ├── src/
-│   ├── main.cpp          # Display/touch/power bring-up, screens, gestures, entity carousel
-│   ├── wifi_portal.cpp    # WiFi provisioning portal, remote config access, HA/OTA settings storage (NVS)
-│   ├── ha_light.cpp       # Minimal Home Assistant REST client (toggle/poll one entity at a time)
-│   ├── ota.cpp             # ArduinoOTA setup and progress tracking
-│   └── font_pl_34.c        # Generated LVGL font (Montserrat + Polish diacritics) - see below
+│   ├── main.cpp             # Display/touch/power bring-up, screens, gestures, entity carousel
+│   ├── wifi_portal.cpp      # WiFi provisioning portal, remote config access, HA/OTA settings storage (NVS)
+│   ├── ha_light.cpp         # Minimal Home Assistant REST client (toggle/poll one entity at a time)
+│   ├── ota.cpp               # ArduinoOTA (push-style, from a computer) setup and progress tracking
+│   ├── update_check.cpp      # Self-update (pull-style, from GitHub Releases) - check/download/verify/flash
+│   └── font_pl_34.c          # Generated LVGL font (Montserrat + Polish diacritics) - see below
 ├── include/
-│   ├── wifi_portal.h, ha_light.h, ota.h   # Public API for the above
-│   └── lv_conf.h            # LVGL build configuration
+│   ├── wifi_portal.h, ha_light.h, ota.h, update_check.h   # Public API for the above
+│   └── lv_conf.h              # LVGL build configuration
 ├── lib/
-│   ├── esp_lcd_sh8601/      # Display driver (Espressif, vendored - see Credits)
-│   └── FT3168/              # Touch controller driver (Waveshare example, vendored - see Credits)
-└── partitions.csv           # Flash layout - includes an OTA (ota_0/ota_1) partition scheme
+│   ├── esp_lcd_sh8601/        # Display driver (Espressif, vendored - see Credits)
+│   └── FT3168/                # Touch controller driver (Waveshare example, vendored - see Credits)
+└── partitions.csv             # Flash layout - includes an OTA (ota_0/ota_1) partition scheme
 ```
 
 ### Regenerating the Polish-language font

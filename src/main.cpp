@@ -36,6 +36,7 @@
 #include "wifi_portal.h"
 #include "ha_light.h"
 #include "ota.h"
+#include "update_check.h"
 
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
@@ -377,6 +378,7 @@ static bool display_init()
 static bool     g_wifiOk         = false;
 static bool     g_ntpConfigured  = false;
 static bool     g_otaInitialized = false; // see wifi_ntp_update_state() - ota_init() must wait until WiFi.mode() has actually run once, or ArduinoOTA.begin()'s UDP/mDNS setup crashes (xQueueSemaphoreTake assert on an uninitialized network stack) - confirmed on real hardware
+static bool     g_updateChecked  = false; // one release-check per WiFi connection, not every loop() tick - see wifi_ntp_update_state()
 static uint32_t g_lastWifiTryMs  = 0;
 static constexpr uint32_t WIFI_RETRY_MS = 15000;
 
@@ -428,10 +430,15 @@ static void wifi_ntp_update_state()
     // still-existing monitor_screen_on_enter() call for the AP-fallback
     // case (no STA yet).
     wifi_monitor_start();
+    if (!g_updateChecked) {
+      g_updateChecked = true;
+      update_check_now(); // blocking HTTPS call - one-shot per connection, see g_updateChecked
+    }
   } else {
     if (g_wifiOk) {
       g_wifiOk = false;
       g_ntpConfigured = false;
+      g_updateChecked = false; // re-check on the next reconnect, not never again
       Serial.println("[WiFi] Disconnected.");
       // Stop the STA-bound monitor server/mDNS now rather than leaving it
       // stale and bound to a connection that's gone (or stuck at 0.0.0.0) -
@@ -457,6 +464,9 @@ static lv_obj_t* clock_battery = nullptr;
 static lv_obj_t* clock_srv_icon = nullptr;
 static lv_obj_t* clock_ha_icon  = nullptr;
 static bool      g_haLastPollOk = false; // meaningful only alongside wifi_portal_has_ha_config()
+// Firmware update available (update_is_available(), see update_check.h) -
+// hidden unless there's actually an update, tap jumps to SCR_UPDATE.
+static lv_obj_t* clock_update_icon = nullptr;
 static lv_obj_t* clock_time    = nullptr;
 static lv_obj_t* clock_date    = nullptr;
 
@@ -478,11 +488,17 @@ static bool g_haLightOn = false;
 static lv_obj_t* lblTouch = nullptr;
 
 // ====== Screens ======
-enum Screen { SCR_CLOCK, SCR_SETUP, SCR_MONITOR };
+// SCR_UPDATE is deliberately NOT part of either swipe rotation (entity
+// carousel or wifi/setup) - it's a tap-to-drill-down from the small update
+// icon on CLOCK (see clock_update_icon), not a swipe destination, so it
+// doesn't complicate the existing two-axis gesture model. Any swipe
+// direction from it just returns to CLOCK.
+enum Screen { SCR_CLOCK, SCR_SETUP, SCR_MONITOR, SCR_UPDATE };
 static Screen     current_screen = SCR_CLOCK;
 static lv_obj_t*  scr_clock   = nullptr;
 static lv_obj_t*  scr_setup   = nullptr;
 static lv_obj_t*  scr_monitor = nullptr;
+static lv_obj_t*  scr_update  = nullptr;
 
 // ====== SETUP screen ======
 static lv_obj_t* setup_ssid_lbl = nullptr;
@@ -492,6 +508,11 @@ static lv_obj_t* setup_ip_lbl   = nullptr;
 static lv_obj_t* monitor_status_lbl  = nullptr;
 static lv_obj_t* monitor_address_lbl = nullptr;
 
+// ====== UPDATE screen ======
+static lv_obj_t* update_version_lbl = nullptr;
+static lv_obj_t* update_status_lbl  = nullptr;
+static lv_obj_t* update_btn         = nullptr;
+
 
 // Forward declarations - switch_screen() calls these, but they're defined
 // further down (near the rest of the SETUP/MONITOR logic).
@@ -500,6 +521,7 @@ static void setup_screen_on_leave();
 static void monitor_screen_on_enter();
 static void monitor_screen_on_leave();
 static void clock_screen_on_enter();
+static void update_screen_on_enter();
 
 static lv_obj_t* screen_obj(Screen s)
 {
@@ -507,6 +529,7 @@ static lv_obj_t* screen_obj(Screen s)
     case SCR_CLOCK:   return scr_clock;
     case SCR_SETUP:   return scr_setup;
     case SCR_MONITOR: return scr_monitor;
+    case SCR_UPDATE:  return scr_update;
   }
   return scr_clock;
 }
@@ -522,6 +545,7 @@ static void switch_screen(Screen s)
   if (s == SCR_CLOCK) clock_screen_on_enter();
   if (s == SCR_SETUP) setup_screen_on_enter();
   if (s == SCR_MONITOR) monitor_screen_on_enter();
+  if (s == SCR_UPDATE) update_screen_on_enter();
 }
 
 // Button (and entity name label, see update_entity_ui()) use the current
@@ -658,6 +682,10 @@ static void gesture_event_cb(lv_event_t* e)
         switch_screen(SCR_CLOCK);
       }
       break;
+    case SCR_UPDATE:
+      // Not part of either rotation group - any swipe just leaves it.
+      if (dir != LV_DIR_NONE) switch_screen(SCR_CLOCK);
+      break;
   }
 }
 
@@ -736,6 +764,25 @@ static void monitor_screen_on_leave()
   // running in the background (see wifi_ntp_update_state()) so the setup
   // page stays reachable from any screen, not just while physically on
   // REMOTE SETUP.
+}
+
+// ====== UPDATE screen hook ======
+static void update_screen_on_enter()
+{
+  if (update_version_lbl) {
+    char buf[96];
+    snprintf(buf, sizeof(buf), "Current: %s\nLatest: %s",
+             update_current_version(),
+             update_is_available() ? update_latest_version() : "(up to date)");
+    lv_label_set_text(update_version_lbl, buf);
+  }
+  if (update_status_lbl) lv_label_set_text(update_status_lbl, "");
+  if (update_btn) {
+    // Dim the button rather than removing it when there's nothing to
+    // install - tapping it while !update_is_available() is a silent no-op
+    // (see its event callback), this just makes that visually obvious.
+    lv_obj_set_style_bg_opa(update_btn, update_is_available() ? LV_OPA_COVER : LV_OPA_40, 0);
+  }
 }
 
 // ====== Touch (FT3168) ======
@@ -871,7 +918,8 @@ void setup()
   scr_clock   = lv_obj_create(NULL);
   scr_setup   = lv_obj_create(NULL);
   scr_monitor = lv_obj_create(NULL);
-  lv_obj_t* screens[] = {scr_clock, scr_setup, scr_monitor};
+  scr_update  = lv_obj_create(NULL);
+  lv_obj_t* screens[] = {scr_clock, scr_setup, scr_monitor, scr_update};
   for (auto* scr : screens) {
     lv_obj_set_style_bg_color(scr, lv_color_black(), 0);
     lv_obj_add_event_cb(scr, gesture_event_cb, LV_EVENT_GESTURE, nullptr);
@@ -910,14 +958,24 @@ void setup()
   clock_srv_icon = lv_label_create(scr_clock);
   lv_label_set_text(clock_srv_icon, LV_SYMBOL_SETTINGS);
   lv_obj_set_style_text_font(clock_srv_icon, &lv_font_montserrat_20, 0);
-  lv_obj_align(clock_srv_icon, LV_ALIGN_TOP_MID, -15, 8);
+  lv_obj_align(clock_srv_icon, LV_ALIGN_TOP_MID, -30, 8);
 
   // Last Home Assistant poll result (g_haLastPollOk, see update_entity_ui()
   // and the periodic poll in loop()) - house icon for "Home" Assistant.
   clock_ha_icon = lv_label_create(scr_clock);
   lv_label_set_text(clock_ha_icon, LV_SYMBOL_HOME);
   lv_obj_set_style_text_font(clock_ha_icon, &lv_font_montserrat_20, 0);
-  lv_obj_align(clock_ha_icon, LV_ALIGN_TOP_MID, 15, 8);
+  lv_obj_align(clock_ha_icon, LV_ALIGN_TOP_MID, 0, 8);
+
+  // Firmware update available (update_is_available()) - hidden by default,
+  // shown/lit only when true (see the 1s tick below); tap jumps straight
+  // to SCR_UPDATE (not a swipe target - see the Screen enum comment).
+  clock_update_icon = lv_label_create(scr_clock);
+  lv_label_set_text(clock_update_icon, LV_SYMBOL_DOWNLOAD);
+  lv_obj_set_style_text_font(clock_update_icon, &lv_font_montserrat_20, 0);
+  lv_obj_align(clock_update_icon, LV_ALIGN_TOP_MID, 30, 8);
+  lv_obj_add_flag(clock_update_icon, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(clock_update_icon, [](lv_event_t*) { switch_screen(SCR_UPDATE); }, LV_EVENT_CLICKED, nullptr);
 
   clock_time = lv_label_create(scr_clock);
   lv_obj_set_style_text_color(clock_time, lv_color_white(), 0);
@@ -1061,10 +1119,59 @@ void setup()
   lv_label_set_text(monitorHint, "Swipe left/right: clock | up/down: wifi setup");
   lv_obj_align(monitorHint, LV_ALIGN_BOTTOM_MID, 0, -20);
 
+  // ===== UPDATE screen =====
+  // Reached only by tapping clock_update_icon on CLOCK, not via swipe -
+  // see the Screen enum comment. update_version_lbl/update_status_lbl get
+  // their real text from update_screen_on_enter() and the button's tap
+  // handler, not here.
+  lv_obj_t* updateTitle = lv_label_create(scr_update);
+  lv_obj_set_style_text_color(updateTitle, lv_color_white(), 0);
+  lv_label_set_text(updateTitle, "FIRMWARE UPDATE");
+  lv_obj_align(updateTitle, LV_ALIGN_TOP_MID, 0, 20);
+
+  update_version_lbl = lv_label_create(scr_update);
+  lv_obj_set_style_text_color(update_version_lbl, lv_color_white(), 0);
+  lv_obj_set_style_text_align(update_version_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(update_version_lbl, "---");
+  lv_obj_align(update_version_lbl, LV_ALIGN_CENTER, 0, -80);
+
+  update_btn = lv_btn_create(scr_update);
+  lv_obj_set_size(update_btn, 200, 70);
+  lv_obj_set_style_radius(update_btn, 16, 0);
+  lv_obj_align(update_btn, LV_ALIGN_CENTER, 0, 0);
+  lv_obj_add_flag(update_btn, LV_OBJ_FLAG_GESTURE_BUBBLE);
+  lv_obj_clear_flag(update_btn, LV_OBJ_FLAG_SCROLLABLE); // see the screens-loop comment above for why
+  lv_obj_t* updateBtnLbl = lv_label_create(update_btn);
+  lv_label_set_text(updateBtnLbl, "Update now");
+  lv_obj_center(updateBtnLbl);
+  lv_obj_add_event_cb(update_btn, [](lv_event_t*) {
+    if (!update_is_available()) return;
+    if (update_status_lbl) lv_label_set_text(update_status_lbl, "Downloading...");
+    lv_timer_handler(); // paint the line above before the blocking call below freezes the UI
+    bool ok = update_perform(); // blocks; on success this restarts the device and never returns
+    if (update_status_lbl) {
+      lv_label_set_text(update_status_lbl, ok ? "Done." : "Update failed - see serial log.");
+    }
+  }, LV_EVENT_CLICKED, nullptr);
+
+  update_status_lbl = lv_label_create(scr_update);
+  lv_obj_set_style_text_color(update_status_lbl, ral7037(), 0);
+  lv_obj_set_style_text_align(update_status_lbl, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(update_status_lbl, "");
+  lv_obj_align(update_status_lbl, LV_ALIGN_CENTER, 0, 60);
+
+  lv_obj_t* updateHint = lv_label_create(scr_update);
+  lv_obj_set_style_text_color(updateHint, ral7037(), 0);
+  lv_obj_set_style_text_align(updateHint, LV_TEXT_ALIGN_CENTER, 0);
+  lv_label_set_text(updateHint, "Swipe: back to clock");
+  lv_obj_align(updateHint, LV_ALIGN_BOTTOM_MID, 0, -20);
+
   lv_scr_load(scr_clock);
 
   wifi_portal_init();
+  update_check_init();
   Serial.printf("[BOOT] Applying saved tz offset: %d min\n", wifi_portal_get_tz_offset_min());
+  Serial.printf("[BOOT] Firmware version: %s\n", update_current_version());
 
   // scr_clock was lv_scr_load()'ed directly above (not via switch_screen()),
   // so its on-enter hook never ran - do it once explicitly now that
@@ -1133,6 +1240,9 @@ void loop()
       bool haOk = wifi_portal_has_ha_config() && g_haLastPollOk;
       lv_obj_set_style_text_color(clock_ha_icon,
         haOk ? lv_color_hex(0x40FF80) : lv_color_hex(0x444444), 0);
+    }
+    if (clock_update_icon) {
+      lv_obj_set_style_opa(clock_update_icon, update_is_available() ? LV_OPA_COVER : LV_OPA_0, 0);
     }
 
     if (clock_battery) {

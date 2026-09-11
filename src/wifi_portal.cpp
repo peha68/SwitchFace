@@ -3,6 +3,7 @@
 // NVS logic).
 
 #include "wifi_portal.h"
+#include "update_check.h"
 
 #include <ctype.h>
 #include <math.h>
@@ -356,7 +357,7 @@ static void handleRoot()
     String displayName = g_deviceName.length() > 0 ? htmlEscape(g_deviceName) : "SwitchFace";
 
     String page;
-    page.reserve(7800); // bumped for the per-entity name/id/color row pairs + OTA card
+    page.reserve(8200); // bumped for the per-entity name/id/color row pairs + OTA + Firmware cards
 
     page += "<!DOCTYPE html><html><head><meta charset='utf-8'>"
             "<meta name='viewport' content='width=device-width, initial-scale=1'>"
@@ -474,6 +475,24 @@ static void handleRoot()
             "<button type='submit'>Save OTA password</button>"
             "</form>"
             "</div>"
+            "<div class='card'>"
+            "<h2>Firmware</h2>"
+            "<label>Current version</label>"
+            "<div style='padding:11px 0'>" + htmlEscape(update_current_version()) + "</div>"
+            "<label>Latest known release</label>"
+            "<div style='padding:11px 0'>"
+            + htmlEscape(update_is_available() ? update_latest_version()
+                         : (strlen(update_latest_version()) ? "(up to date)" : "(not checked yet)"))
+            + "</div>"
+            "<form action='/update_check_now' method='GET' style='display:inline-block;width:48%'>"
+            "<button type='submit' class='secondary'>Check now</button>"
+            "</form>";
+    if (update_is_available()) {
+        page += "<form action='/update_now' method='POST' style='display:inline-block;width:48%;margin-left:4%'>"
+                "<button type='submit'>Update now</button>"
+                "</form>";
+    }
+    page += "</div>"
             "<script>"
             "function scanNow(){"
             "var sel=document.getElementById('ssid_scan');"
@@ -673,6 +692,43 @@ static void handleSaveOta()
     ESP.restart();
 }
 
+// GET, not POST - it doesn't change any stored config, just re-runs the
+// (idempotent) release check, so a plain link/redirect-back is fine here
+// unlike the other handlers.
+static void handleUpdateCheckNow()
+{
+    bool ok = update_check_now();
+    Serial.printf("[WIFI-PORTAL] Update check requested from web page: %s\n", ok ? "done" : "failed");
+
+    server.sendHeader("Location", "/");
+    server.sendHeader("Connection", "close");
+    server.send(303); // see-other - browser re-GETs "/", showing the refreshed version info
+}
+
+// Blocking (the whole download+verify+flash), same as every other
+// synchronous action this server already performs (HA polls, WiFi
+// reconnect waits) - see update_perform()'s own doc comment for why this
+// is safe not to background. On success it restarts the device itself and
+// this response never gets sent (the connection just drops, same as the
+// WiFi/timezone/OTA-password save handlers); on failure it returns
+// normally so the page can say so instead of leaving the browser hanging.
+static void handleUpdateNow()
+{
+    Serial.println("[WIFI-PORTAL] Update requested from web page - downloading...");
+    bool ok = update_perform();
+
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html",
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width, initial-scale=1'></head>"
+        "<body style='font-family:sans-serif;background:#111;color:#eee;padding:20px'>"
+        + String(ok ? "<h2>Done.</h2><p>Shouldn't be possible to see this - the device "
+                       "restarts on success.</p>"
+                     : "<h2>Update failed.</h2><p>Current firmware was left untouched. "
+                       "Check the serial log for details.</p>")
+        + "</body></html>");
+}
+
 // Browsers silently GET /favicon.ico on every page load - without this,
 // that fell through to onNotFound() -> handleRoot(), serving the ENTIRE
 // ~7KB setup page a second time for nothing. WebServer (this library) only
@@ -700,6 +756,8 @@ static void ensureHttpHandlersRegistered()
     server.on("/save_name", HTTP_POST, handleSaveName);
     server.on("/save_ha", HTTP_POST, handleSaveHa);
     server.on("/save_ota", HTTP_POST, handleSaveOta);
+    server.on("/update_check_now", HTTP_GET, handleUpdateCheckNow);
+    server.on("/update_now", HTTP_POST, handleUpdateNow);
     server.onNotFound(handleRoot);
     g_httpHandlersRegistered = true;
 }

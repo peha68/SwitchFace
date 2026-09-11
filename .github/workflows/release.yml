@@ -1,0 +1,56 @@
+name: Release
+
+# Publishing a new firmware version is just: git tag vX.Y.Z && git push --tags
+# This builds it and creates the matching GitHub Release with firmware.bin
+# attached, which is what src/update_check.cpp polls for on the device
+# side (api.github.com/repos/.../releases/latest).
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write # needed for `gh release create`
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # get_version.py (scripts/get_version.py, run via platformio.ini's
+          # extra_scripts) needs `git describe --tags` to actually see tag
+          # history - the default shallow checkout (depth 1) only fetches
+          # the single tagged commit, which makes describe fall back to a
+          # bare commit hash instead of the tag name.
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install PlatformIO
+        run: pip install -U platformio
+
+      - name: Build firmware
+        run: pio run -e esp32-s3-devkitc-1
+
+      - name: Compute firmware SHA256
+        id: sha
+        run: |
+          HASH=$(sha256sum .pio/build/esp32-s3-devkitc-1/firmware.bin | cut -d' ' -f1)
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # SHA256 line's exact format ("SHA256: <64 lowercase hex chars>")
+          # is required as-is - src/update_check.cpp's update_check_now()
+          # parses it out of this release body verbatim.
+          printf 'SHA256: %s\n\nInstall over WiFi from your computer, or let the device check for and install this release on its own from the update icon on the CLOCK screen, or the Firmware card on the setup page.\n' \
+            "${{ steps.sha.outputs.hash }}" > /tmp/release_notes.txt
+          gh release create "${{ github.ref_name }}" \
+            .pio/build/esp32-s3-devkitc-1/firmware.bin \
+            --title "${{ github.ref_name }}" \
+            --notes-file /tmp/release_notes.txt
