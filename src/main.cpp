@@ -455,18 +455,21 @@ static void wifi_ntp_update_state()
 }
 
 // ====== CLOCK screen ======
-static lv_obj_t* clock_wifi    = nullptr;
-static lv_obj_t* clock_offline = nullptr;
+static lv_obj_t* clock_wifi    = nullptr; // white = connected, red = not - see the 1s tick below
 static lv_obj_t* clock_battery = nullptr;
 // Top-center status icons: setup/config web server reachable, and last
 // Home Assistant poll result - dim gray when off/unknown, lit when good.
-// Updated once a second alongside clock_wifi/clock_offline below.
+// Updated once a second alongside clock_wifi below.
 static lv_obj_t* clock_srv_icon = nullptr;
 static lv_obj_t* clock_ha_icon  = nullptr;
 static bool      g_haLastPollOk = false; // meaningful only alongside wifi_portal_has_ha_config()
 // Firmware update available (update_is_available(), see update_check.h) -
 // hidden unless there's actually an update, tap jumps to SCR_UPDATE.
 static lv_obj_t* clock_update_icon = nullptr;
+// Same visibility/tap-target as clock_update_icon, just a much bigger,
+// harder-to-miss text version in the middle of the screen - the icon
+// alone is small/easy to overlook.
+static lv_obj_t* clock_update_text = nullptr;
 static lv_obj_t* clock_time    = nullptr;
 static lv_obj_t* clock_date    = nullptr;
 
@@ -940,12 +943,6 @@ void setup()
   lv_obj_set_style_text_font(clock_wifi, &lv_font_montserrat_20, 0);
   lv_obj_align(clock_wifi, LV_ALIGN_TOP_LEFT, 8, 8);
 
-  clock_offline = lv_label_create(scr_clock);
-  lv_label_set_text(clock_offline, "OFFLINE");
-  lv_obj_set_style_text_color(clock_offline, lv_color_hex(0xFF4040), 0);
-  lv_obj_set_style_text_font(clock_offline, &lv_font_montserrat_20, 0);
-  lv_obj_align(clock_offline, LV_ALIGN_TOP_LEFT, 46, 8);
-
   clock_battery = lv_label_create(scr_clock);
   lv_label_set_text(clock_battery, LV_SYMBOL_BATTERY_EMPTY " --.--V");
   lv_obj_set_style_text_color(clock_battery, lv_color_white(), 0);
@@ -997,6 +994,17 @@ void setup()
   // adds the Polish diacritics (Ą Ć Ę Ł Ń Ó Ś Ź Ż and lowercase) that none
   // of LVGL's built-in fonts include (ASCII + Latin-1 only) - needed since
   // entity names are free-text and this project's whole audience is Polish.
+  // Between clock_date (-85) and clock_entity_name_lbl (-5) below - hidden
+  // (opacity toggled in the 1s tick) unless update_is_available().
+  clock_update_text = lv_label_create(scr_clock);
+  lv_label_set_text(clock_update_text, "UPDATE AVAILABLE");
+  lv_obj_set_style_text_color(clock_update_text, lv_color_hex(0xFFA500), 0);
+  lv_obj_set_style_text_font(clock_update_text, &lv_font_montserrat_20, 0);
+  lv_obj_set_style_text_align(clock_update_text, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_align(clock_update_text, LV_ALIGN_CENTER, 0, -45);
+  lv_obj_add_flag(clock_update_text, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_event_cb(clock_update_text, [](lv_event_t*) { switch_screen(SCR_UPDATE); }, LV_EVENT_CLICKED, nullptr);
+
   clock_entity_name_lbl = lv_label_create(scr_clock);
   lv_obj_set_style_text_color(clock_entity_name_lbl, ral7037(), 0);
   lv_obj_set_style_text_font(clock_entity_name_lbl, &font_pl_34, 0);
@@ -1229,8 +1237,9 @@ void loop()
   static uint32_t lastClock = 0;
   if (now - lastClock >= 1000) {
     lastClock = now;
-    if (clock_wifi)    lv_obj_set_style_opa(clock_wifi, g_wifiOk ? LV_OPA_COVER : (((now / 500) % 2) ? LV_OPA_COVER : LV_OPA_0), 0);
-    if (clock_offline) lv_obj_set_style_opa(clock_offline, g_wifiOk ? LV_OPA_0 : LV_OPA_COVER, 0);
+    if (clock_wifi) {
+      lv_obj_set_style_text_color(clock_wifi, g_wifiOk ? lv_color_white() : lv_color_hex(0xFF4040), 0);
+    }
 
     if (clock_srv_icon) {
       lv_obj_set_style_text_color(clock_srv_icon,
@@ -1241,8 +1250,21 @@ void loop()
       lv_obj_set_style_text_color(clock_ha_icon,
         haOk ? lv_color_hex(0x40FF80) : lv_color_hex(0x444444), 0);
     }
+    // Both hidden (opacity) AND made non-clickable when there's no update -
+    // otherwise an invisible label would still silently swallow a tap in
+    // the middle of CLOCK, which would be a confusing dead zone even
+    // though switch_screen(SCR_UPDATE) itself is harmless with nothing to
+    // install.
+    bool updAvail = update_is_available();
     if (clock_update_icon) {
-      lv_obj_set_style_opa(clock_update_icon, update_is_available() ? LV_OPA_COVER : LV_OPA_0, 0);
+      lv_obj_set_style_opa(clock_update_icon, updAvail ? LV_OPA_COVER : LV_OPA_0, 0);
+      if (updAvail) lv_obj_add_flag(clock_update_icon, LV_OBJ_FLAG_CLICKABLE);
+      else lv_obj_clear_flag(clock_update_icon, LV_OBJ_FLAG_CLICKABLE);
+    }
+    if (clock_update_text) {
+      lv_obj_set_style_opa(clock_update_text, updAvail ? LV_OPA_COVER : LV_OPA_0, 0);
+      if (updAvail) lv_obj_add_flag(clock_update_text, LV_OBJ_FLAG_CLICKABLE);
+      else lv_obj_clear_flag(clock_update_text, LV_OBJ_FLAG_CLICKABLE);
     }
 
     if (clock_battery) {
