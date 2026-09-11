@@ -5,6 +5,11 @@
 // Self-update: checks GitHub Releases for a newer firmware.bin than the
 // one currently running, and can download+flash it. FIRMWARE_VERSION
 // comes from git (see scripts/get_version.py) - never hardcode it here.
+//
+// Verified end-to-end on real hardware across v0.1.0 -> v0.1.1 -> v0.1.2:
+// check, download, SHA256 verify, flash, and reboot into the new version
+// all confirmed working, both from the web page's Firmware card and (as
+// of v0.1.2) from the on-device UPDATE screen's button.
 #ifndef FIRMWARE_VERSION
 #define FIRMWARE_VERSION "unknown"
 #endif
