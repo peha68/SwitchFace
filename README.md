@@ -1,6 +1,7 @@
 # SwitchFace
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Latest release](https://img.shields.io/github/v/release/peha68/SwitchFace)](https://github.com/peha68/SwitchFace/releases/latest)
 [![Platform: ESP32-S3](https://img.shields.io/badge/platform-ESP32--S3-blue.svg)](platformio.ini)
 [![Framework: Arduino](https://img.shields.io/badge/framework-Arduino-00979D.svg)](platformio.ini)
 
